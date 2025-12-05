@@ -12,7 +12,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o epg-sync ./cmd/server/main.go
 
 
-FROM node:24-alpine AS frontend-builder
+FROM node:22-alpine AS frontend-builder
 
 WORKDIR /web
 
