@@ -1,7 +1,6 @@
 services:
   epg-sync:
-    image: epg-sync:latest
-    build: .
+    image: ghcr.io/epg-sync/epg-sync:latest
     container_name: epg-sync
     restart: always
     network_mode: bridge

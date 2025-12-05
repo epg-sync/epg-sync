@@ -147,7 +147,7 @@ logger:
   level: info          # debug, info, warn, error
   format: console          # json, console
   output: both          # stdout, stderr, file, both
-  filename: logs/epgsync.log
+  filename: /logs/epgsync.log
   max_size: 100         # MB
   max_backups: 10
   max_age: 30          # days
