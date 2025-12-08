@@ -150,6 +150,14 @@ providers:
     timeout: 10s
     rate_limit: 5
     max_retries: 2
+  - name: hebei
+    id: hebei
+    base_url: https://api.cmc.hebtv.com
+    enabled: true
+    priority: 2
+    timeout: 10s
+    rate_limit: 5
+    max_retries: 2
 
 logger:
   level: info          # debug, info, warn, error
