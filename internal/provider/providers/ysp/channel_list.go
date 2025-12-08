@@ -329,4 +329,8 @@ var channelList = []*model.ProviderChannel{
 		ID:   "600193252",
 		Name: "兵团卫视",
 	},
+	{
+		ID:   "600190408",
+		Name: "甘肃卫视",
+	},
 }
