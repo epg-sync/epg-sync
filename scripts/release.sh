@@ -18,6 +18,9 @@ fi
 
 set -euo pipefail
 
+# 注意：变量后面紧跟中文时必须写成 ${var}。macOS 自带的 bash 3.2 在 UTF-8 locale 下
+# 会把中文字符的字节当成变量名的一部分，"$branch，" 会被解析成一个不存在的变量。
+
 RELEASE_BRANCH="main"
 REMOTE="origin"
 
@@ -48,7 +51,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 # --- 前置校验 -------------------------------------------------------------
 branch="$(git rev-parse --abbrev-ref HEAD)"
-[ "$branch" = "$RELEASE_BRANCH" ] || die "当前在 $branch，请切到 $RELEASE_BRANCH 再发版"
+[ "$branch" = "$RELEASE_BRANCH" ] || die "当前在 ${branch}，请切到 $RELEASE_BRANCH 再发版"
 
 [ -z "$(git status --porcelain)" ] || die "工作区不干净，请先提交或 stash"
 
