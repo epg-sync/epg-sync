@@ -11,6 +11,11 @@
 #   scripts/release.sh 0.2.0        # 显式指定
 #   scripts/release.sh --dry-run    # 只做校验和版本推算，不打 tag
 
+# 脚本依赖 bash 语法；用 sh 运行时（Linux 上通常是 dash）自动切到 bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 RELEASE_BRANCH="main"
@@ -21,6 +26,7 @@ die() {
   exit 1
 }
 info() { printf '\033[36m==>\033[0m %s\n' "$1"; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$1" >&2; }
 
 dry_run=0
 bump=""
@@ -47,7 +53,27 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 [ -z "$(git status --porcelain)" ] || die "工作区不干净，请先提交或 stash"
 
 info "同步远端..."
-git fetch --tags --prune "$REMOTE" "$RELEASE_BRANCH" || die "git fetch 失败"
+# 历史遗留的 tag（如 0.0.10、0.0.11）在远端被移到了别的提交，本地还指向旧位置，
+# git fetch 会对这些 tag 报 "would clobber existing tag" 并以非 0 退出。这类拒绝是逐个 ref 的，
+# 分支和其余 tag 照常更新，也不影响版本推算，所以只警告不中断；其它错误仍然直接退出。
+fetch_rc=0
+fetch_log="$(git fetch --tags --prune "$REMOTE" "$RELEASE_BRANCH" 2>&1)" || fetch_rc=$?
+printf '%s\n' "$fetch_log" | grep -v 'would clobber existing tag' | grep -v '^$' || true
+
+if [ "$fetch_rc" -ne 0 ]; then
+  stale_tags="$(printf '%s\n' "$fetch_log" |
+    sed -n 's/.*\[rejected\][[:space:]]*\([^[:space:]]*\).*would clobber.*/\1/p')"
+  other_rejects="$(printf '%s\n' "$fetch_log" | grep '\[rejected\]' | grep -v 'would clobber' || true)"
+
+  if [ -z "$stale_tags" ] || [ -n "$other_rejects" ]; then
+    printf '%s\n' "$fetch_log" >&2
+    die "git fetch 失败"
+  fi
+
+  warn "以下 tag 本地与远端指向不同的提交，已跳过（不影响发版）："
+  printf '%s\n' "$stale_tags" | sed 's/^/       /' >&2
+  warn "如需与远端对齐：git fetch --tags --force $REMOTE"
+fi
 
 local_head="$(git rev-parse HEAD)"
 remote_head="$(git rev-parse "$REMOTE/$RELEASE_BRANCH")"
