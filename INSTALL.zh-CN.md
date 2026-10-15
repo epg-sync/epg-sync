@@ -4,58 +4,110 @@
 
 ## 前置要求
 
-在开始之前，请确保你的服务器或本地环境已安装以下软件：
-
 - **Docker** & **Docker Compose**
-- **MySQL** (可选，如果配置为 sqlite 则不需要)
-- **Redis** (可选，如果配置为内存缓存则不需要)
+
+数据库使用 PostgreSQL，已包含在 `docker-compose.yml` 中，不需要单独安装。表结构和内置频道、时区数据会在程序首次启动时自动创建。
 
 ---
 
-## 1. 配置文件
+## 1. 使用 Docker Compose 部署 (推荐)
 
-在启动服务前，需要正确配置 `config/config.yaml` 文件。
+### 步骤 1：准备文件
 
-### 基础配置
+把项目根目录下的 `docker-compose.yml` 和 `.env.example` 放到服务器的同一个目录，然后创建 `.env`：
 
-找到项目根目录下的 `config/config.yaml`，根据你的实际环境修改以下核心项：
-
-```yaml
-server:
-  host: 0.0.0.0
-  port: 5678 # 服务监听端口
-  mode: release # 生产环境建议设置为 release 开发环境可设置为 development
-  jwt_secret:
-    "" # 请修改为至少32位的随机字符串 用于 JWT 签名 可以用下面的命令生成：
-    # openssl rand -hex 16
-  jwt_expire_hours: 24 # JWT 过期时间，单位小时
-
-# 缓存设置
-cache:
-  type: redis # 推荐使用 'redis'，测试可用 'memory'
-  addr: 127.0.0.1:6379 # Redis 地址
-  password: "" # Redis 密码
-  db: 0
-
-# 数据库设置
-database:
-  driver: mysql # 可选 'mysql' 或 'sqlite'
-  host: 127.0.0.1 # 数据库 IP
-  port: 3306
-  user: root # 数据库用户名
-  password: your_password # 数据库密码
-  name: epg_hub # 数据库名 或者 /config/epg_hub.db (sqlite)
+```bash
+cp .env.example .env
 ```
+
+编辑 `.env`，把 `POSTGRES_PASSWORD` 改成你自己的密码。这是唯一必填的配置：Postgres 容器和程序都从这份 `.env` 读取，其余各项都有默认值（见下文「配置说明」）。
+
+### 步骤 2：启动服务
+
+```bash
+docker compose up -d
+```
+
+会启动两个容器：
+
+- `epg-sync`：程序本身，Web 管理面板和接口都在 3000 端口
+- `epg-sync-db`：PostgreSQL 17，数据保存在 `./data/postgres`
+
+查看日志确认运行状态：
+
+```bash
+docker compose logs -f epg-sync
+```
+
+启动日志会打印实际生效的配置，例如 `env=prod config_files=[] database=postgres@db:5432/postgres`。首次启动时还会打印默认管理员密码（`Default admin created. User: admin, Pass: ...`）。
+
+## 2. 配置说明
+
+### 配置从哪里来
+
+配置分两类，每一项只能在一个地方设置：
+
+| 类别 | 设置位置 | 包含 |
+| --- | --- | --- |
+| 部署信息和机密 | 环境变量（`.env`） | 运行环境、数据库连接、JWT 密钥 |
+| 程序行为 | 配置文件 `config/config.yaml` | 端口、超时、日志、抓取源等 |
+
+所有默认值都定义在 [`internal/config/defaults.go`](internal/config/defaults.go) 一处。加载顺序如下，后者覆盖前者：
+
+```
+默认值 < config/config.yaml < config/config.<APP_ENV>.yaml < 环境变量
+```
+
+- 两个配置文件都是可选的，不存在时使用默认值。
+- 配置文件采用严格解析：写错的键、或写了本应用环境变量设置的项（如 `database.host`、`server.jwt_secret`），启动时会直接报错。
+- 程序启动时会读取工作目录下的 `.env`（本地开发用），但不会覆盖已经存在的环境变量。
+
+### 环境变量（`.env`）
+
+完整列表也在 [`.env.example`](.env.example) 中，注释里的值就是默认值。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `POSTGRES_PASSWORD` | 无，**必填** | 数据库密码 |
+| `POSTGRES_USER` | `postgres` | 数据库用户名 |
+| `POSTGRES_DB` | 与 `POSTGRES_USER` 相同 | 数据库名 |
+| `POSTGRES_HOST` | `localhost` | 数据库主机。Docker 中由 compose 固定为 `db` |
+| `POSTGRES_PORT` | `5432` | 数据库端口。本地开发时也是数据库映射到本机的端口 |
+| `POSTGRES_SSLMODE` | `disable` | 连接外部数据库时可设为 `require` |
+| `APP_ENV` | `prod` | `prod` 或 `dev`。`dev` 时额外读取 `config/config.dev.yaml`。Docker 中固定为 `prod` |
+| `JWT_SECRET` | 空 | 登录令牌的签名密钥。为空时首次启动自动生成并保存到数据库，重启后登录状态不会失效 |
+| `EPG_IMAGE` | `ghcr.io/epg-sync/epg-sync:latest` | 仅 docker compose 使用：程序镜像地址 |
+
+数据库相关变量的名称和默认值与 [Postgres 官方镜像](https://hub.docker.com/_/postgres) 一致，所以 compose 中数据库容器和程序读取同一份 `.env`，两边的用户名、库名一定相同。
+
+### 配置文件（`config/config.yaml`）
+
+只需写要修改的项，可参考仓库中的 [`config/config.yaml`](config/config.yaml)。Docker 部署时放在宿主机的 `./config/config.yaml`。
+
+| 键 | 默认值 | 说明 |
+| --- | --- | --- |
+| `server.port` | `5678` | 程序监听端口（Docker 中由 nginx 代理到 3000） |
+| `server.mode` | `release`（`APP_ENV=dev` 时为 `development`） | 运行模式 |
+| `server.timeout` | `90` | HTTP 读写超时，单位秒 |
+| `server.jwt_expire_hours` | `24` | 登录有效期，单位小时 |
+| `database.max_open_conns` | `10` | 数据库最大连接数 |
+| `database.debug` | `false` | 是否打印 SQL |
+| `logger.level` | `info` | `debug` / `info` / `warn` / `error` |
+| `logger.format` | `console` | `console` / `json` |
+| `logger.output` | `stdout` | `stdout` / `stderr` / `file` / `both` |
+| `logger.filename` | `logs/epgsync.log` | `output` 为 `file` 或 `both` 时的日志文件。Docker 中对应宿主机 `./logs` |
+| `logger.max_size` | `100` | 单个日志文件大小上限，单位 MB |
+| `logger.max_backups` | `10` | 保留的旧日志文件数 |
+| `logger.max_age` | `30` | 旧日志保留天数 |
+| `logger.compress` | `false` | 是否压缩旧日志 |
+| `logger.enable_caller` | `false` | 是否记录调用位置 |
+| `logger.enable_stack_trace` | `true` | 是否记录堆栈 |
+| `logger.stack_trace_level` | `error` | 从哪个级别开始记录堆栈 |
+| `providers` | 空 | 抓取源覆盖项，见下文 |
 
 ### 渠道源配置
 
-所有内置的抓取源都在代码里自带默认配置（地址、优先级、并发数等），默认全部启用，`providers` 留空即可：
-
-```yaml
-providers: {}
-```
-
-只有需要调整时，才以 provider id 为 key 写要覆盖的项，没写的项沿用默认值：
+所有内置的抓取源都在代码里自带默认配置（地址、优先级、并发数等），默认全部启用。只有需要调整时，才以 provider id 为 key 写要覆盖的项，没写的项沿用默认值：
 
 ```yaml
 providers:
@@ -69,87 +121,75 @@ providers:
 
 可用的 provider id：`bfgd` `btzx` `cctv_cn` `daxiang` `fengshow` `hainan` `hebei` `homeplus` `iqilu` `jsp` `jstv` `kknews` `migu_tv` `shanxi` `suzhou` `sxrtv` `xiamen` `ysp`
 
-> **升级提示**：旧版本的列表写法（`providers:` 下面是 `- name: ... id: ...`）已不再支持，启动时会报错。升级后请删掉整段列表，按上面的写法只保留需要覆盖的项。
+## 3. 用 GUI 客户端查看数据库
 
-## 2. 数据库初始化
+数据库端口只对服务器本机开放（`127.0.0.1:5432`），不会暴露到公网。
 
-在首次运行前，如果配置文件中选择了 MySQL 作为数据库驱动，则需要初始化数据库结构。选择 sqlite 则跳过此步骤。
+- **在服务器本机**：用 DBeaver、TablePlus、DataGrip 等客户端直接连接 `127.0.0.1:5432`。
+- **从你自己的电脑**：在客户端的连接设置里开启 SSH 隧道，填服务器的 SSH 信息，数据库主机仍然填 `127.0.0.1:5432`。
 
-1. 创建数据库：
+连接信息就是 `.env` 中的值：用户名 `POSTGRES_USER`（默认 `postgres`），数据库 `POSTGRES_DB`（默认与用户名相同），密码 `POSTGRES_PASSWORD`。
 
-项目提供了 SQL 初始化脚本。请登录你的 MySQL 数据库，创建一个名为 epg_sync (或你配置文件中指定的名称) 的数据库，并导入表结构。
-
-```sql
-CREATE DATABASE epg_sync DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-```
-
-2. 导入数据： 使用项目目录下的 config/epg_sync.sql 文件进行导入。
+也可以直接用命令行（使用默认用户名时）：
 
 ```bash
-mysql -u root -p epg_sync < config/epg_sync.sql
+docker compose exec db psql -U postgres
 ```
 
-## 3. 使用 Docker 部署 (推荐)
+## 4. 从旧版本升级
 
-### 步骤 1：检查 Docker Compose 文件
+旧版本使用 MySQL / SQLite 和 Redis，新版本只使用 PostgreSQL，数据不会自动迁移：
 
-打开项目根目录下的 docker-compose.yml，确保卷挂载和端口映射正确。
-
-注意端口映射： 配置文件 config.yaml 中默认服务端口为 5678。如果你的 docker-compose.yml 映射的是 3000:3000，请确保两者一致，或者修改映射关系。
-
-建议修改 docker-compose.yml 如下以匹配默认配置：
-
-```yaml
-services:
-  epg-sync:
-    image: epg-sync:latest
-    build: .
-    container_name: epg-sync
-    restart: always
-    ports:
-      - "5678:5678" # 左边是宿主机端口，右边是容器内端口(需与 config.yaml 一致)
-    volumes:
-      - ./config:/config # 挂载配置文件目录
-      - ./logs:/logs # 挂载日志目录
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-```
-
-### 步骤 2：启动服务
-
-在项目根目录下执行：
+- **节目单**：新版本启动后会重新抓取。
+- **频道映射**：启动时自动重新生成。
+- **管理员账号**：会重新生成，密码见首次启动日志。
+- **自定义频道**：内置频道会自动写入。如果你在旧版本里新增或修改过频道，可以用接口导出再导入，已存在的频道会被更新：
 
 ```bash
-docker-compose up -d --build
+# 1. 从旧版本导出（旧服务还在运行时）
+OLD_TOKEN=$(curl -s -X POST http://旧服务器:3000/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"旧密码"}' | jq -r .data.token)
+curl -s -H "Authorization: Bearer $OLD_TOKEN" http://旧服务器:3000/admin/channels \
+  | jq '{channels: .data}' > channels.json
+
+# 2. 导入到新版本
+NEW_TOKEN=$(curl -s -X POST http://新服务器:3000/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"新密码"}' | jq -r .data.token)
+curl -s -X POST http://新服务器:3000/admin/channels/batch \
+  -H "Authorization: Bearer $NEW_TOKEN" -H 'Content-Type: application/json' -d @channels.json
 ```
 
-查看日志确认运行状态：
+旧版本的 `config.yaml` 需要调整，否则启动时会报错：
 
-```bash
-docker-compose logs -f
-```
+- 删除 `cache`、`database`（`max_open_conns`、`debug` 除外）、`scheduler` 段，以及 `server.host`、`server.jwt_secret`。数据库连接和 JWT 密钥改用环境变量。
+- `providers` 段改为按 id 覆盖的写法，旧的列表写法不再支持。
+- 配置目录在容器中改为 `/app/config`，compose 已按此挂载。
 
-## 4. 手动编译运行
-
-如果你想在本地进行开发或不使用 Docker：
+## 5. 本地开发
 
 ### 后端 (Go)
 
-1. 确保 Go 环境 (Go 1.20+) 已安装。
-
-2. 进入项目根目录。
-
-3. 运行服务：
+1. 确保 Go 1.24+ 已安装。
+2. 准备 `.env`：`cp .env.example .env`，填写 `POSTGRES_PASSWORD`，并取消注释 `APP_ENV=dev`。
+3. 可选：创建 `config/config.dev.yaml`，只写和 `config/config.yaml` 不同的项（例如 `logger.level: debug`）。该文件已被 git 忽略。
+4. 启动本地数据库：
 
 ```bash
-go run cmd/server/main.go
+docker compose up -d db
 ```
+
+5. 运行服务：
+
+```bash
+go run ./cmd/server
+```
+
+程序会读取项目根目录的 `.env`，和本地数据库容器使用同一份配置，不需要重复填写密码。
 
 ### 前端 (Next.js)
 
 1. 确保 Node.js 和包管理器 (npm/yarn/pnpm) 已安装。
-
-2. 进入 web 目录,安装依赖,并启动服务器：
+2. 进入 web 目录，安装依赖，并启动服务器：
 
 ```bash
 cd web
@@ -157,30 +197,30 @@ pnpm install
 pnpm run dev
 ```
 
-## 5. 访问管理面板
+## 6. 访问管理面板
 
-默认情况下，EPG Sync 的 Web 管理面板运行在 3000 端口。打开浏览器，访问：
+Web 管理面板运行在 3000 端口。打开浏览器，访问：
 
 ```
 http://<服务器IP>:3000
 ```
 
-登录用户名是 `admin`，初始密码会在启动日志中生成 ，请查看日志获取。首次登录后建议立即修改密码。
+登录用户名是 `admin`，初始密码会在启动日志中生成，请查看日志获取。首次登录后建议立即修改密码。
 
 你可以在登录后管理节目频道、查看节目单、同步节目单等操作。
 
-## 6. 获取节目单接口
+## 7. 获取节目单接口
 
-EPG Sync 支持 XMLTV 格式 和 DIYP 格式。你可以通过以下 URL 获取节目单：
+EPG Sync 支持 XMLTV 格式和 DIYP 格式。你可以通过以下 URL 获取节目单：
 
 XMLTV 格式：
 
 ```
-http://<服务器IP>:<端口>/api/xmltv
+http://<服务器IP>:端口/api/xmltv
 ```
 
 DIYP 格式：
 
 ```
-http://<服务器IP>:<端口>/api/diyp
+http://<服务器IP>:端口/api/diyp
 ```

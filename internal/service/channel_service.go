@@ -7,7 +7,6 @@ import (
 	"github.com/epg-sync/epgsync/internal/model"
 	"github.com/epg-sync/epgsync/internal/provider"
 	"github.com/epg-sync/epgsync/internal/repository"
-	"github.com/epg-sync/epgsync/pkg/errors"
 )
 
 type ChannelService struct {
@@ -38,18 +37,6 @@ func (s *ChannelService) GetChannel(ctx context.Context, channelID string) (*mod
 	}
 
 	return channel, nil
-}
-
-func (s *ChannelService) ListChannels(ctx context.Context, providerID string) ([]*model.Channel, error) {
-	if providerID != "" {
-		return s.channelRepo.ListByProviderID(ctx, providerID)
-	}
-
-	return nil, errors.InvalidParam("provider_id", "provider_id is required")
-}
-
-func (s *ChannelService) SearchChannels(ctx context.Context, query string, opts *repository.ListOptions) ([]*model.Channel, error) {
-	return s.channelRepo.Search(ctx, query, opts)
 }
 
 func (s *ChannelService) CreateChannel(ctx context.Context, channel *model.Channel) (*model.Channel, error) {

@@ -45,8 +45,8 @@ RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 3000
 
-VOLUME ["/config", "/logs"]
+VOLUME ["/app/config", "/app/logs"]
 
-ENV CONFIG_PATH=/config/config.yaml
+ENV APP_ENV=prod
 
 ENTRYPOINT ["/app/entrypoint.sh"]

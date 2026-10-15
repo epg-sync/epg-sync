@@ -23,8 +23,8 @@ English | [简体中文](./README.zh-CN.md)
   - Sync status monitoring
   - Program guide preview and query
 - **Automated Sync**: Background scheduled tasks automatically update EPG data.
-- **High-performance Caching**: Supports Redis and in-memory caching to improve data response speed.
-- **Flexible Deployment**: Supports containerized deployment via Docker.
+- **Fast Responses**: Provider responses and generated EPG files are cached in memory.
+- **Out-of-the-box Deployment**: One `docker compose up -d` starts the app with PostgreSQL; tables and built-in channel data are created automatically.
 
 ## 🚀 Quick Start
 

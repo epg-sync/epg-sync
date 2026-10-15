@@ -1,43 +1,20 @@
-server:
-  host: 0.0.0.0
-  port: 5678
-  mode: release
-  timeout: 90
-  jwt_secret: ""
-  jwt_expire_hours: 24
-
-cache:
-  type: memory
-  addr: redis.orb.local:6379
-  password: "1"
-  db: 1
-  ttl: 24h
-
-database:
-  driver: sqlite
-  host: mysql.orb.local
-  port: 3306
-  user: root
-  password: 123456
-  name: /config/epg_sync.db
-  debug: false
-# 所有内置 provider 默认启用，这里只写需要覆盖的项（以 provider id 为 key）
-providers: {}
-#  ysp:
-#    enabled: false
-#  homeplus:
-#    priority: 1
-#    rate_limit: 3
-
-logger:
-  level: info          # debug, info, warn, error
-  format: console          # json, console
-  output: both          # stdout, stderr, file, both
-  filename: /logs/epgsync.log
-  max_size: 100         # MB
-  max_backups: 10
-  max_age: 30          # days
-  compress: false
-  enable_caller: false
-  enable_stack_trace: true
-  stack_trace_level: error
+# 程序行为配置，可选。所有项都有默认值，只需写要修改的项。
+#   - 全部配置项及默认值见 INSTALL.md「配置说明」，默认值定义在 internal/config/defaults.go
+#   - 数据库连接和 JWT 密钥不在这里配置，用环境变量设置，见 .env.example
+#   - APP_ENV=dev 时，config/config.dev.yaml 会再覆盖本文件中的同名项
+#
+# 示例：
+#
+# server:
+#   timeout: 120
+#
+# logger:
+#   level: debug
+#   output: both            # 同时写入 logs/epgsync.log
+#
+# providers:                # 以 provider id 为 key，只写要覆盖的字段
+#   ysp:
+#     enabled: false
+#   homeplus:
+#     priority: 1
+#     rate_limit: 3

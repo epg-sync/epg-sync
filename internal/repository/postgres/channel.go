@@ -1,9 +1,7 @@
-// pkg/repository/mysql/channel.go
-package mysql
+package postgres
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/epg-sync/epgsync/internal/model"
@@ -11,6 +9,7 @@ import (
 	"github.com/epg-sync/epgsync/pkg/errors"
 	"github.com/epg-sync/epgsync/pkg/logger"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type channelRepo struct {
@@ -40,7 +39,14 @@ func (r *channelRepo) CreateBatch(ctx context.Context, channels []*model.Channel
 	if len(channels) == 0 {
 		return nil
 	}
-	if err := r.db.WithContext(ctx).Create(channels).Error; err != nil {
+	// 按 channel_id upsert，导入时已存在的频道（如内置种子频道）会被更新
+	err := r.db.WithContext(ctx).
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "channel_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"display_name", "category", "area", "logo_url", "regexp", "timezone", "updated_at"}),
+		}).
+		Create(channels).Error
+	if err != nil {
 		logger.Error("Failed to create channels in batch",
 			logger.Err(err),
 			logger.Int("count", len(channels)),
@@ -80,26 +86,13 @@ func (r *channelRepo) GetByID(ctx context.Context, channelID string) (*model.Cha
 	return &channel, nil
 }
 
-func (r *channelRepo) ListByProviderID(ctx context.Context, providerID string) ([]*model.Channel, error) {
-	var channels []*model.Channel
-	err := r.db.WithContext(ctx).
-		Where("provider_id = ?", providerID).
-		Order("number ASC").
-		Find(&channels).Error
-	if err != nil {
-		logger.Error("Failed to list channels by provider",
-			logger.Err(err),
-			logger.String("provider_id", providerID),
-		)
-		return nil, errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to list channels")
-	}
-
-	return channels, nil
-}
-
 func (r *channelRepo) GetByChannelName(ctx context.Context, channelName string) (*model.Channel, error) {
 	var channel model.Channel
-	err := r.db.WithContext(ctx).Where("? REGEXP `regexp`", channelName).First(&channel).Error
+	// 不区分大小写的正则匹配，多个频道都匹配时取 id 最小的
+	err := r.db.WithContext(ctx).
+		Where("regexp <> '' AND ? ~* regexp", channelName).
+		Order("id").
+		First(&channel).Error
 
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -110,37 +103,6 @@ func (r *channelRepo) GetByChannelName(ctx context.Context, channelName string) 
 
 	return &channel, nil
 
-}
-
-func (r *channelRepo) Search(ctx context.Context, query string, opts *repository.ListOptions) ([]*model.Channel, error) {
-	if opts == nil {
-		opts = &repository.ListOptions{
-			Page:     1,
-			PageSize: 50,
-			OrderBy:  "name",
-			Order:    "asc",
-		}
-	}
-
-	searchPattern := "%" + query + "%"
-	offset := (opts.Page - 1) * opts.PageSize
-
-	var channels []*model.Channel
-	err := r.db.WithContext(ctx).
-		Where("name LIKE ? OR `group` LIKE ?", searchPattern, searchPattern).
-		Order(fmt.Sprintf("%s %s", opts.OrderBy, opts.Order)).
-		Limit(opts.PageSize).
-		Offset(offset).
-		Find(&channels).Error
-	if err != nil {
-		logger.Error("Failed to search channels",
-			logger.Err(err),
-			logger.String("query", query),
-		)
-		return nil, errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to search channels")
-	}
-
-	return channels, nil
 }
 
 func (r *channelRepo) Update(ctx context.Context, channel *model.Channel) error {
@@ -188,26 +150,6 @@ func (r *channelRepo) Delete(ctx context.Context, channelID string) error {
 	if result.RowsAffected == 0 {
 		return errors.ChannelNotFound(channelID)
 	}
-
-	return nil
-}
-
-func (r *channelRepo) DeleteByProviderID(ctx context.Context, providerID string) error {
-	result := r.db.WithContext(ctx).
-		Where("provider_id = ?", providerID).
-		Delete(&model.Channel{})
-	if result.Error != nil {
-		logger.Error("Failed to delete channels by provider",
-			logger.Err(result.Error),
-			logger.String("provider_id", providerID),
-		)
-		return errors.Wrap(result.Error, errors.ErrCodeDatabaseQuery, "failed to delete channels")
-	}
-
-	logger.Info("Deleted channels by provider",
-		logger.String("provider_id", providerID),
-		logger.Int64("count", result.RowsAffected),
-	)
 
 	return nil
 }
