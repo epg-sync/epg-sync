@@ -15,6 +15,7 @@ import (
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/fengshow"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/hainan"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/hebei"
+	_ "github.com/epg-sync/epgsync/internal/provider/providers/homeplus"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/iqilu"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/jsp"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/jstv"
