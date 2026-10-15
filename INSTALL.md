@@ -28,10 +28,11 @@ Edit `.env` and set `POSTGRES_PASSWORD` to your own password. It is the only req
 docker compose up -d
 ```
 
-This starts two containers:
+This starts three containers:
 
 - `epg-sync`: the application; the web admin panel and the APIs are on port 3000
 - `epg-sync-db`: PostgreSQL 17, with data stored in `./data/postgres`
+- `epg-sync-watchtower`: updates `epg-sync` automatically after a new release, see below
 
 Check the logs to confirm it is running:
 
@@ -40,6 +41,15 @@ docker compose logs -f epg-sync
 ```
 
 The startup log prints the effective configuration, for example `env=prod config_files=[] database=postgres@db:5432/postgres`. On first start it also prints the default admin password (`Default admin created. User: admin, Pass: ...`).
+
+### Automatic updates and rollback
+
+- **Automatic updates**: `epg-sync-watchtower` checks for a new image every 5 minutes. After a release it pulls the new image and recreates the `epg-sync` container, so you don't need to log in to the server.
+  - It only updates `epg-sync`. The database is never updated automatically, because a major Postgres upgrade needs a manual data migration.
+  - It uses the scope `epg-sync`, so it leaves other projects' containers on the server alone.
+- **Run `docker compose up -d` after editing `.env`**: watchtower recreates the container with the old container's environment, and `docker restart` doesn't re-read `.env` either.
+- **Rollback**: set `IMAGE_TAG=0.1.0` (the version to go back to) in `.env`, then run `docker compose up -d`. A fixed version tag never changes, so automatic updates pause as well. Remove the line and run `docker compose up -d` again to follow the latest version.
+- **Logs**: after a container is recreated, `docker logs` only shows the new container's output. To keep history across versions, set `logger.output: both` in `./config/config.yaml`, which writes logs to `./logs`.
 
 ## 2. Configuration
 
@@ -76,7 +86,8 @@ The full list is also in [`.env.example`](.env.example); the values in its comme
 | `POSTGRES_SSLMODE` | `disable` | Set to `require` for an external database |
 | `APP_ENV` | `prod` | `prod` or `dev`. `dev` also reads `config/config.dev.yaml`. Always `prod` in Docker |
 | `JWT_SECRET` | empty | Login token signing secret. If empty, one is generated on first start and stored in the database, so logins stay valid across restarts |
-| `EPG_IMAGE` | `ghcr.io/epg-sync/epg-sync:latest` | Used by docker compose only: the application image |
+| `IMAGE_TAG` | `latest` | Used by docker compose only: the application image version. Set a version number to roll back, which also pauses automatic updates |
+| `DOCKER_API_VERSION` | `1.40` | Used by docker compose only: the Docker API version watchtower uses; lower it for older Docker Engines |
 
 The database variables use the same names and defaults as the [official Postgres image](https://hub.docker.com/_/postgres), so in compose the database container and the application read the same `.env` and always agree on the user and database name.
 
@@ -196,6 +207,23 @@ cd web
 pnpm install
 pnpm run dev
 ```
+
+### Releasing a New Version
+
+On a clean `main` branch that is in sync with `origin/main`, run:
+
+```bash
+scripts/release.sh            # choose patch / minor / major / custom interactively
+scripts/release.sh patch      # or pass it directly: patch / minor / major / X.Y.Z
+scripts/release.sh --dry-run  # only validate and show the version and changes, no tag
+```
+
+After you confirm, the script creates and pushes an `X.Y.Z` tag. Everything after that is automatic:
+
+1. GitHub Actions runs the tests (including the Postgres integration tests); if they fail, nothing is published
+2. It builds amd64 / arm64 images and pushes them to GHCR, tagged `X.Y.Z`, `X.Y`, `latest` and the commit hash
+3. It creates a GitHub Release with auto-generated release notes
+4. Watchtower on the server pulls the new image and recreates the container within 5 minutes
 
 ## 6. Access the Admin Panel
 
