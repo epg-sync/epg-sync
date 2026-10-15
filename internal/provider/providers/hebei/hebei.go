@@ -64,7 +64,15 @@ type HebeiProvider struct {
 }
 
 func init() {
-	provider.Register("hebei", New)
+	provider.Register(provider.Definition{
+		ID:         "hebei",
+		BaseURL:    "https://api.cmc.hebtv.com",
+		Priority:   2,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

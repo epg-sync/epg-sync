@@ -89,7 +89,7 @@ func (p *BaseProvider) GetTimeout() time.Duration {
 	if p.config.Timeout <= 0 {
 		return 30 * time.Second
 	}
-	return time.Duration(p.config.Timeout) * time.Second
+	return p.config.Timeout
 }
 
 func (p *BaseProvider) GetRetry() int {
@@ -273,7 +273,7 @@ func (p *BaseProvider) FetchEPGBatch(ctx context.Context, fetcher EPGFetcher, ch
 		return result, nil
 	}
 
-	maxConcurrency := p.GetIntSetting("rate_limit")
+	maxConcurrency := p.config.RateLimit
 	if maxConcurrency <= 0 {
 		maxConcurrency = 5
 	}

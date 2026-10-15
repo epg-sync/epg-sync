@@ -37,7 +37,15 @@ type XiamenProvider struct {
 var accessToken = "R621C86FCU319FA04BK783FB5EBIFA29A0DEP2BF4M340CAC5V0Z339C9W16D7E5AFCA1ADFD1"
 
 func init() {
-	provider.Register("bfgd", New)
+	provider.Register(provider.Definition{
+		ID:         "bfgd",
+		BaseURL:    "http://slave.bfgd.com.cn",
+		Priority:   1,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

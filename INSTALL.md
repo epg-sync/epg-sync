@@ -49,19 +49,27 @@ database:
 
 ### Provider Source Configuration
 
-In the `providers` section, you can enable or disable specific scraping sources, and you can also implement and add custom sources. The following is an example of enabling the Yangshipin source:
+Every built-in provider ships with its own defaults in code (base URL, priority, concurrency, and so on) and is enabled by default, so `providers` can be left empty:
+
+```yaml
+providers: {}
+```
+
+To change something, add an entry keyed by provider id with only the fields you want to override. Anything you leave out keeps its default:
 
 ```yaml
 providers:
-  - name: ysp
-    id: ysp
-    base_url: https://capi.yangshipin.cn
-    enabled: true
-    priority: 2 # Priority; lower values have higher priority
-    timeout: 10s
-    rate_limit: 10 # Maximum concurrent requests
-    max_retries: 3 # Maximum number of retries
+  ysp:
+    enabled: false # disable the Yangshipin source
+  homeplus:
+    priority: 1 # lower values have higher priority
+    rate_limit: 3 # maximum concurrent requests
+    timeout: 15s
 ```
+
+Available provider ids: `bfgd` `btzx` `cctv_cn` `daxiang` `fengshow` `hainan` `hebei` `homeplus` `iqilu` `jsp` `jstv` `kknews` `migu_tv` `shanxi` `suzhou` `sxrtv` `xiamen` `ysp`
+
+> **Upgrade note**: the old list format (`- name: ... id: ...` entries under `providers:`) is no longer supported and fails at startup. After upgrading, delete the whole list and keep only the overrides you need, as shown above.
 
 ## 2. Database Initialization
 

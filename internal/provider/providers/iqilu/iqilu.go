@@ -71,7 +71,15 @@ var (
 )
 
 func init() {
-	provider.Register("iqilu", New)
+	provider.Register(provider.Definition{
+		ID:         "iqilu",
+		BaseURL:    "https://sdxw.iqilu.com",
+		Priority:   1,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

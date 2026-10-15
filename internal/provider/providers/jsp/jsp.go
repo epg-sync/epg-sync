@@ -59,7 +59,15 @@ type JspProvider struct {
 var userAgent = "GVideo/5.10.04 (com.sobey.JiangXiTV; build:5.10.031; iOS 26.1.0) Alamofire/5.7.1"
 
 func init() {
-	provider.Register("jsp", New)
+	provider.Register(provider.Definition{
+		ID:         "jsp",
+		BaseURL:    "https://app.jxgdw.com",
+		Priority:   2,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

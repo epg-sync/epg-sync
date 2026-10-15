@@ -22,7 +22,15 @@ var (
 )
 
 func init() {
-	provider.Register("ysp", New)
+	provider.Register(provider.Definition{
+		ID:         "ysp",
+		BaseURL:    "https://capi.yangshipin.cn",
+		Priority:   2,
+		Timeout:    10 * time.Second,
+		RateLimit:  10,
+		MaxRetries: 3,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

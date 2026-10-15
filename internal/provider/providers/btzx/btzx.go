@@ -24,7 +24,15 @@ type ProgramResponse struct {
 }
 
 func init() {
-	provider.Register("btzx", New)
+	provider.Register(provider.Definition{
+		ID:         "btzx",
+		BaseURL:    "https://api.btzx.com.cn",
+		Priority:   1,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 type BTZXProvider struct {

@@ -62,7 +62,15 @@ type HainanProvider struct {
 }
 
 func init() {
-	provider.Register("hainan", New)
+	provider.Register(provider.Definition{
+		ID:         "hainan",
+		BaseURL:    "https://www.hnntv.cn",
+		Priority:   2,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

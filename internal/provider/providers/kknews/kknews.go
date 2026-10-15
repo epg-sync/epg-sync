@@ -65,7 +65,15 @@ var (
 )
 
 func init() {
-	provider.Register("kknews", New)
+	provider.Register(provider.Definition{
+		ID:         "kknews",
+		BaseURL:    "https://kapi.kankanews.com",
+		Priority:   1,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

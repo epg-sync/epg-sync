@@ -24,7 +24,16 @@ type CCTVEPGResponse struct {
 }
 
 func init() {
-	provider.Register("cctv_cn", New)
+	provider.Register(provider.Definition{
+		ID:         "cctv_cn",
+		Name:       "cctv.cn",
+		BaseURL:    "https://zy.api.cntv.cn",
+		Priority:   3,
+		Timeout:    10 * time.Second,
+		RateLimit:  10,
+		MaxRetries: 3,
+		New:        New,
+	})
 }
 
 type CCTVProvider struct {

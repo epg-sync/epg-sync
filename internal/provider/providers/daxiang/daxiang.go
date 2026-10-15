@@ -99,7 +99,15 @@ const (
 )
 
 func init() {
-	provider.Register("daxiang", New)
+	provider.Register(provider.Definition{
+		ID:         "daxiang",
+		BaseURL:    "https://pubmod.hntv.tv",
+		Priority:   2,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {
