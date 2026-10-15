@@ -1,7 +1,10 @@
 # 所有配置都在同目录的 .env 中，两个服务共用（见 .env.example）
 services:
   epg-sync:
-    image: ${EPG_IMAGE:-ghcr.io/epg-sync/epg-sync:latest}
+    # 回滚：在 .env 里写 IMAGE_TAG=0.1.0 再 docker compose up -d。
+    # 固定版本号的镜像不会再变，watchtower 也就不再更新，等于暂停自动更新。
+    image: ghcr.io/epg-sync/epg-sync:${IMAGE_TAG:-latest}
+    pull_policy: always
     container_name: epg-sync
     restart: always
     ports:
@@ -15,12 +18,24 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # 只有带这两个 label 的容器会被本项目的 watchtower 自动更新
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: epg-sync
+    # 镜像更新是重建容器，docker logs 只保留当前容器的输出。
+    # 需要跨版本的历史日志时，在 config/config.yaml 里设 logger.output: both，写入 ./logs
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
       - /etc/localtime:/etc/localtime:ro
 
   db:
+    # 不加 watchtower label：数据库大版本升级需要手动迁移数据，不能自动更新
     image: postgres:17-alpine
     container_name: epg-sync-db
     restart: always
@@ -36,3 +51,29 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # 定期检查 GHCR，发现 epg-sync 有新镜像就自动拉取并重建容器，发版后不用登录服务器。
+  # 镜像是公开的，不需要 docker login。
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: epg-sync-watchtower
+    restart: always
+    environment:
+      # watchtower 1.7.1 默认用 Docker API 1.25，新版 Docker Engine 最低要求 1.40
+      DOCKER_API_VERSION: ${DOCKER_API_VERSION:-1.40}
+      # 只管带 watchtower.enable label 的容器，不碰服务器上其它容器
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "300"
+      WATCHTOWER_INCLUDE_RESTARTING: "true"
+      # 同一台服务器上有别的项目的 watchtower 时，各自只管自己 scope 内的容器
+      WATCHTOWER_SCOPE: epg-sync
+    labels:
+      com.centurylinklabs.watchtower.scope: epg-sync
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock

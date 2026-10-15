@@ -28,10 +28,11 @@ cp .env.example .env
 docker compose up -d
 ```
 
-会启动两个容器：
+会启动三个容器：
 
 - `epg-sync`：程序本身，Web 管理面板和接口都在 3000 端口
 - `epg-sync-db`：PostgreSQL 17，数据保存在 `./data/postgres`
+- `epg-sync-watchtower`：发布新版本后自动更新 `epg-sync`，见下文
 
 查看日志确认运行状态：
 
@@ -40,6 +41,15 @@ docker compose logs -f epg-sync
 ```
 
 启动日志会打印实际生效的配置，例如 `env=prod config_files=[] database=postgres@db:5432/postgres`。首次启动时还会打印默认管理员密码（`Default admin created. User: admin, Pass: ...`）。
+
+### 自动更新与回滚
+
+- **自动更新**：`epg-sync-watchtower` 每 5 分钟检查一次镜像。发布新版本后，它会自动拉取新镜像并重建 `epg-sync` 容器，不需要登录服务器。
+  - 它只更新 `epg-sync`。数据库不会自动更新，因为 Postgres 大版本升级需要手动迁移数据。
+  - 它使用 scope `epg-sync`，不会动服务器上其它项目的容器。
+- **修改 `.env` 后要执行 `docker compose up -d`**：watchtower 重建容器时沿用旧容器的环境变量，`docker restart` 也不会重新读取 `.env`。
+- **回滚**：在 `.env` 里写 `IMAGE_TAG=0.1.0`（要回到的版本），再执行 `docker compose up -d`。固定版本的镜像不会再变，自动更新也就暂停了。删掉这一行再执行一次 `docker compose up -d`，即恢复跟随最新版本。
+- **日志**：重建容器后，`docker logs` 只剩新容器的输出。需要跨版本的历史日志时，在 `./config/config.yaml` 里设置 `logger.output: both`，日志会写入 `./logs`。
 
 ## 2. 配置说明
 
@@ -76,7 +86,8 @@ docker compose logs -f epg-sync
 | `POSTGRES_SSLMODE` | `disable` | 连接外部数据库时可设为 `require` |
 | `APP_ENV` | `prod` | `prod` 或 `dev`。`dev` 时额外读取 `config/config.dev.yaml`。Docker 中固定为 `prod` |
 | `JWT_SECRET` | 空 | 登录令牌的签名密钥。为空时首次启动自动生成并保存到数据库，重启后登录状态不会失效 |
-| `EPG_IMAGE` | `ghcr.io/epg-sync/epg-sync:latest` | 仅 docker compose 使用：程序镜像地址 |
+| `IMAGE_TAG` | `latest` | 仅 docker compose 使用：程序镜像版本。设为具体版本号即回滚，并暂停自动更新 |
+| `DOCKER_API_VERSION` | `1.40` | 仅 docker compose 使用：watchtower 调用的 Docker API 版本，Docker Engine 较旧时可调低 |
 
 数据库相关变量的名称和默认值与 [Postgres 官方镜像](https://hub.docker.com/_/postgres) 一致，所以 compose 中数据库容器和程序读取同一份 `.env`，两边的用户名、库名一定相同。
 
@@ -196,6 +207,23 @@ cd web
 pnpm install
 pnpm run dev
 ```
+
+### 发布新版本
+
+在干净、且与 `origin/main` 同步的 `main` 分支上执行：
+
+```bash
+scripts/release.sh            # 交互选择 patch / minor / major / 自定义版本号
+scripts/release.sh patch      # 也可以直接指定：patch / minor / major / X.Y.Z
+scripts/release.sh --dry-run  # 只校验并显示将要发布的版本和改动，不打 tag
+```
+
+脚本确认后会打一个 `X.Y.Z` 的 tag 并推送，之后全部自动完成：
+
+1. GitHub Actions 运行测试（包括 Postgres 集成测试），失败则停止，不会推出镜像
+2. 构建 amd64 / arm64 镜像并推送到 GHCR，标签为 `X.Y.Z`、`X.Y`、`latest` 和提交哈希
+3. 自动创建 GitHub Release，附上自动生成的更新说明
+4. 服务器上的 watchtower 在 5 分钟内拉取新镜像并重建容器
 
 ## 6. 访问管理面板
 
