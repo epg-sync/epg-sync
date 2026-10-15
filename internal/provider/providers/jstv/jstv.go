@@ -39,7 +39,15 @@ type AccessesTokenResponse struct {
 }
 
 func init() {
-	provider.Register("jstv", New)
+	provider.Register(provider.Definition{
+		ID:         "jstv",
+		BaseURL:    "https://live-lizhi.jstv.com",
+		Priority:   1,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 type JSTVProvider struct {

@@ -53,7 +53,15 @@ var (
 )
 
 func init() {
-	provider.Register("homeplus", New)
+	provider.Register(provider.Definition{
+		ID:         "homeplus",
+		BaseURL:    "https://www.homeplus.net.tw",
+		Priority:   2,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

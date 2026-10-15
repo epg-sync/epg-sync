@@ -70,12 +70,7 @@ func (app *App) initialize() error {
 		return fmt.Errorf("init repositories: %w", err)
 	}
 
-	chain, err := provider.GlobalFactory().CreateChain(app.cfg.Providers, app.cache)
-	if err != nil {
-		logger.Error("Failed to create provider chain", logger.Err(err))
-		return err
-	}
-	app.providerChain = chain
+	app.providerChain = provider.GlobalFactory().CreateChain(app.cfg.Providers, app.cache)
 
 	if err := app.initializeServices(); err != nil {
 		return fmt.Errorf("init provider chain: %w", err)

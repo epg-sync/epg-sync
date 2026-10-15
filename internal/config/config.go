@@ -18,12 +18,12 @@ var (
 )
 
 type AppConfig struct {
-	Server    ServerConfig           `yaml:"server"`
-	Cache     CacheConfig            `yaml:"cache"`
-	Providers []model.ProviderConfig `yaml:"providers"`
-	Database  DatabaseConfig         `yaml:"database"`
-	Scheduler SchedulerConfig        `yaml:"scheduler"`
-	Logger    logger.Config          `yaml:"logger"`
+	Server    ServerConfig            `yaml:"server"`
+	Cache     CacheConfig             `yaml:"cache"`
+	Providers model.ProviderOverrides `yaml:"providers"`
+	Database  DatabaseConfig          `yaml:"database"`
+	Scheduler SchedulerConfig         `yaml:"scheduler"`
+	Logger    logger.Config           `yaml:"logger"`
 }
 
 type ServerConfig struct {

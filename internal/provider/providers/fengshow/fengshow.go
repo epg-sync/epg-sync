@@ -47,7 +47,15 @@ func New(config *model.ProviderConfig) (provider.Provider, error) {
 }
 
 func init() {
-	provider.Register("fengshow", New)
+	provider.Register(provider.Definition{
+		ID:         "fengshow",
+		BaseURL:    "https://m.fengshows.com",
+		Priority:   1,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func (p *IfengProvider) HealthCheck(ctx context.Context) *model.ProviderHealth {

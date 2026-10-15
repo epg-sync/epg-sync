@@ -49,19 +49,27 @@ database:
 
 ### 渠道源配置
 
-在 `providers` 部分，你可以启用或禁用特定的抓取源，同时你可以实现并添加自定义源。以下是一个启用央视频源的示例：
+所有内置的抓取源都在代码里自带默认配置（地址、优先级、并发数等），默认全部启用，`providers` 留空即可：
+
+```yaml
+providers: {}
+```
+
+只有需要调整时，才以 provider id 为 key 写要覆盖的项，没写的项沿用默认值：
 
 ```yaml
 providers:
-  - name: ysp
-    id: ysp
-    base_url: https://capi.yangshipin.cn
-    enabled: true
-    priority: 2 # 优先级，数值越小优先级越高
-    timeout: 10s
-    rate_limit: 10 # 最大同时请求数
-    max_retries: 3 # 最大重试次数
+  ysp:
+    enabled: false # 禁用央视频源
+  homeplus:
+    priority: 1 # 优先级，数值越小优先级越高
+    rate_limit: 3 # 最大同时请求数
+    timeout: 15s
 ```
+
+可用的 provider id：`bfgd` `btzx` `cctv_cn` `daxiang` `fengshow` `hainan` `hebei` `homeplus` `iqilu` `jsp` `jstv` `kknews` `migu_tv` `shanxi` `suzhou` `sxrtv` `xiamen` `ysp`
+
+> **升级提示**：旧版本的列表写法（`providers:` 下面是 `- name: ... id: ...`）已不再支持，启动时会报错。升级后请删掉整段列表，按上面的写法只保留需要覆盖的项。
 
 ## 2. 数据库初始化
 

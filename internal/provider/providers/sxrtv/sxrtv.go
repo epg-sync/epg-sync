@@ -52,7 +52,15 @@ type SXRTVProvider struct {
 }
 
 func init() {
-	provider.Register("sxrtv", New)
+	provider.Register(provider.Definition{
+		ID:         "sxrtv",
+		BaseURL:    "https://apphhplushttps.sxrtv.com",
+		Priority:   3,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

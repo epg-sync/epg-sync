@@ -41,7 +41,15 @@ var (
 )
 
 func init() {
-	provider.Register("suzhou", New)
+	provider.Register(provider.Definition{
+		ID:         "suzhou",
+		BaseURL:    "https://kszapi1.kan0512.com",
+		Priority:   1,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 func New(config *model.ProviderConfig) (provider.Provider, error) {

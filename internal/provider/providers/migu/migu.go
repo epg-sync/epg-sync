@@ -27,7 +27,15 @@ type ProgramResponse struct {
 }
 
 func init() {
-	provider.Register("migu_tv", New)
+	provider.Register(provider.Definition{
+		ID:         "migu_tv",
+		BaseURL:    "https://program-sc.miguvideo.com",
+		Priority:   4,
+		Timeout:    10 * time.Second,
+		RateLimit:  5,
+		MaxRetries: 2,
+		New:        New,
+	})
 }
 
 type MiguProvider struct {
