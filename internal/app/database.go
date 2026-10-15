@@ -1,77 +1,47 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 
+	"github.com/epg-sync/epgsync/internal/database"
 	"github.com/epg-sync/epgsync/internal/model"
 	"github.com/epg-sync/epgsync/pkg/logger"
 	"github.com/epg-sync/epgsync/pkg/utils"
-	"github.com/glebarez/sqlite"
-	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
-	"gorm.io/gorm/schema"
+	"gorm.io/gorm/clause"
 )
 
+const settingJWTSecret = "jwt_secret"
+
 func (app *App) initializeDatabase() error {
-	logger.Debug("Initializing database...",
-		logger.String("driver", app.cfg.Database.Driver),
-		logger.String("host", app.cfg.Database.Host),
-		logger.Int("port", app.cfg.Database.Port),
-	)
-	gormConfig := &gorm.Config{
-		NamingStrategy: schema.NamingStrategy{
-			SingularTable: true,
-		},
-	}
+	ctx := context.Background()
 
-	var dialector gorm.Dialector
-	databaseCfg := app.cfg.Database
-
-	switch databaseCfg.Driver {
-	case "mysql":
-		logger.Debug("Connecting to MySQL...",
-			logger.String("host", databaseCfg.Host),
-			logger.Int("port", databaseCfg.Port))
-
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&timeout=10s&readTimeout=10s&writeTimeout=10s",
-			databaseCfg.User, databaseCfg.Password, databaseCfg.Host, databaseCfg.Port, databaseCfg.Name)
-		dialector = mysql.Open(dsn)
-	case "sqlite":
-		logger.Debug("Connecting to SQLite...",
-			logger.String("filepath", databaseCfg.Name))
-
-		dbPath := databaseCfg.Name
-		if filepath.Ext(dbPath) == "" {
-			dbPath += ".db"
-		}
-		dir := filepath.Dir(dbPath)
-		if dir != "." && dir != "/" {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create database directory: %w", err)
-			}
-		}
-		logger.Info("Connecting to SQLite...", logger.String("file", dbPath))
-		dialector = sqlite.Open(dbPath)
-	default:
-		return fmt.Errorf("unsupported database driver: %s", databaseCfg.Driver)
-	}
-
-	db, err := gorm.Open(dialector, gormConfig)
-
+	logger.Debug("Connecting to Postgres...")
+	db, err := database.Open(ctx, app.cfg.Database)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return err
+	}
+	app.db = db
+
+	if err := database.Migrate(ctx, db); err != nil {
+		return err
 	}
 
-	if app.cfg.Database.Debug {
-		app.db = db.Debug()
-	} else {
-		app.db = db
-	}
-
-	if err := seedDefaultData(app.db); err != nil {
+	if err := seedDefaultData(db); err != nil {
 		logger.Error("Failed to seed default data", logger.Err(err))
+	}
+
+	if app.cfg.Server.JWTSecret == "" {
+		secret, err := loadOrCreateSetting(db, settingJWTSecret, func() (string, error) {
+			logger.Info("No JWT secret configured, generating one and storing it in the database")
+			return utils.GenerateRandomString(48)
+		})
+		if err != nil {
+			return fmt.Errorf("load jwt secret: %w", err)
+		}
+		app.cfg.Server.JWTSecret = secret
 	}
 
 	logger.Debug("Database initialized successfully")
@@ -103,4 +73,31 @@ func seedDefaultData(db *gorm.DB) error {
 		logger.Info(fmt.Sprintf("Default admin created. User: admin, Pass: %s", randomPassword))
 	}
 	return nil
+}
+
+// loadOrCreateSetting 读取 settings 表中的值，不存在时用 generate 生成并保存
+func loadOrCreateSetting(db *gorm.DB, key string, generate func() (string, error)) (string, error) {
+	var setting model.Setting
+	err := db.Where("key = ?", key).First(&setting).Error
+	if err == nil {
+		return setting.Value, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", err
+	}
+
+	value, err := generate()
+	if err != nil {
+		return "", err
+	}
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&model.Setting{Key: key, Value: value}).Error; err != nil {
+		return "", err
+	}
+
+	// 并发启动时可能被别的实例先写入，以库里的值为准
+	if err := db.Where("key = ?", key).First(&setting).Error; err != nil {
+		return "", err
+	}
+	return setting.Value, nil
 }

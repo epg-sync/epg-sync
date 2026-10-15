@@ -1,4 +1,4 @@
-package mysql
+package postgres
 
 import (
 	"context"
@@ -33,7 +33,8 @@ func (r *programRepo) CreateBatch(ctx context.Context, programs []*model.Program
 	if len(programs) == 0 {
 		return nil
 	}
-	if err := r.db.WithContext(ctx).Create(programs).Error; err != nil {
+	// 分批写入，避免超过 Postgres 单条语句 65535 个参数的上限
+	if err := r.db.WithContext(ctx).CreateInBatches(programs, 1000).Error; err != nil {
 		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to create programs in batch")
 	}
 

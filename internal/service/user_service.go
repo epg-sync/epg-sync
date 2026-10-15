@@ -11,14 +11,16 @@ import (
 )
 
 type UserService struct {
-	userRepo  repository.UserRepository
-	jwtSecret string
+	userRepo       repository.UserRepository
+	jwtSecret      string
+	jwtExpireHours int
 }
 
-func NewUserService(userRepo repository.UserRepository, jwtSecret string) *UserService {
+func NewUserService(userRepo repository.UserRepository, jwtSecret string, jwtExpireHours int) *UserService {
 	return &UserService{
-		userRepo:  userRepo,
-		jwtSecret: jwtSecret,
+		userRepo:       userRepo,
+		jwtSecret:      jwtSecret,
+		jwtExpireHours: jwtExpireHours,
 	}
 }
 
@@ -67,7 +69,7 @@ func (s *UserService) Login(ctx context.Context, username, password string) (str
 	}
 
 	// 生成token (24小时有效)
-	token, err := utils.GenerateToken(user.ID, user.Username, user.Role, s.jwtSecret, 24)
+	token, err := utils.GenerateToken(user.ID, user.Username, user.Role, s.jwtSecret, s.jwtExpireHours)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to generate token: %w", err)
 	}

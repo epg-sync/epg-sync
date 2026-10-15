@@ -1,13 +1,38 @@
+# 所有配置都在同目录的 .env 中，两个服务共用（见 .env.example）
 services:
   epg-sync:
-    image: ghcr.io/epg-sync/epg-sync:latest
+    image: ${EPG_IMAGE:-ghcr.io/epg-sync/epg-sync:latest}
     container_name: epg-sync
     restart: always
-    network_mode: bridge
     ports:
       - "3000:3000"
+    env_file: .env
+    # 只写 compose 内部特有的事实：容器里固定为 prod，数据库在 db 服务的 5432 端口
+    environment:
+      APP_ENV: prod
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
-      - ./config:/config
-      - ./logs:/logs
-      - /etc/timezone:/etc/timezone:ro
+      - ./config:/app/config
+      - ./logs:/app/logs
       - /etc/localtime:/etc/localtime:ro
+
+  db:
+    image: postgres:17-alpine
+    container_name: epg-sync-db
+    restart: always
+    env_file: .env
+    # 只对本机开放，远程用 GUI 客户端时通过 SSH 隧道连接
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      # 走 TCP 检查，避免镜像初始化阶段的临时实例被误判为就绪
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

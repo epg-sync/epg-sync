@@ -1,4 +1,4 @@
-package mysql
+package postgres
 
 import (
 	"context"
@@ -8,7 +8,14 @@ import (
 	"github.com/epg-sync/epgsync/internal/repository"
 	"github.com/epg-sync/epgsync/pkg/logger"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+// 同一个 provider 频道只保留一条映射，重新匹配时覆盖旧结果
+var upsertMapping = clause.OnConflict{
+	Columns:   []clause.Column{{Name: "provider_id"}, {Name: "provider_channel_id"}},
+	DoUpdates: clause.AssignmentColumns([]string{"canonical_id", "provider_channel_name", "confidence", "updated_at"}),
+}
 
 type channelMappingsRepo struct {
 	*BaseRepository
@@ -22,7 +29,7 @@ func (r *channelMappingsRepo) Create(ctx context.Context, mapping *model.Channel
 	mapping.CreatedAt = time.Now()
 	mapping.UpdatedAt = time.Now()
 
-	if err := r.db.WithContext(ctx).Create(mapping).Error; err != nil {
+	if err := r.db.WithContext(ctx).Clauses(upsertMapping).Create(mapping).Error; err != nil {
 		logger.Error("Failed to create channel mapping",
 			logger.Err(err),
 			logger.String("channel_id", mapping.ProviderChannelID),
@@ -38,7 +45,7 @@ func (r *channelMappingsRepo) CreateBatch(ctx context.Context, mappings []*model
 		return nil
 	}
 
-	if err := r.db.WithContext(ctx).Create(mappings).Error; err != nil {
+	if err := r.db.WithContext(ctx).Clauses(upsertMapping).Create(mappings).Error; err != nil {
 		logger.Error("Failed to create channel mapping",
 			logger.Err(err),
 			logger.Int("count", len(mappings)),

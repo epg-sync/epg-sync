@@ -1,4 +1,3 @@
-// pkg/repository/repository.go
 package repository
 
 import (
@@ -21,11 +20,8 @@ type ChannelRepository interface {
 	GetAllChannels(ctx context.Context) ([]*model.Channel, error)
 	GetByID(ctx context.Context, id string) (*model.Channel, error)
 	GetByChannelName(ctx context.Context, channelName string) (*model.Channel, error)
-	ListByProviderID(ctx context.Context, providerID string) ([]*model.Channel, error)
-	Search(ctx context.Context, query string, opts *ListOptions) ([]*model.Channel, error)
 	Update(ctx context.Context, channel *model.Channel) error
 	Delete(ctx context.Context, id string) error
-	DeleteByProviderID(ctx context.Context, providerID string) error
 	Count(ctx context.Context) (int64, error)
 }
 
@@ -70,11 +66,4 @@ type UserRepository interface {
 	Update(ctx context.Context, user *model.User) error
 	Delete(ctx context.Context, id int64) error
 	List(ctx context.Context, offset, limit int) ([]*model.User, int64, error)
-}
-
-type ListOptions struct {
-	Page     int
-	PageSize int
-	OrderBy  string
-	Order    string // asc, desc
 }
