@@ -158,6 +158,15 @@ providers:
     timeout: 10s
     rate_limit: 5
     max_retries: 2
+  - name: homeplus
+    id: homeplus
+    base_url: https://www.homeplus.net.tw
+    enabled: true
+    priority: 2
+    timeout: 10s
+    rate_limit: 5
+    max_retries: 2
+
 
 logger:
   level: info          # debug, info, warn, error
