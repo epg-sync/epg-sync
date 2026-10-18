@@ -108,8 +108,9 @@ func (c *Chain) FetchEPGParallel(ctx context.Context, channelMappingInfo []*mode
 			}
 		}
 
+		// 每批只含部分 provider 的频道，其余 provider 跳过是正常情况
 		if len(cmInfos) == 0 {
-			logger.Warn("No channel mapping info for provider",
+			logger.Debug("No channel mapping info for provider",
 				logger.String("provider_id", provider.GetID()),
 			)
 			continue
