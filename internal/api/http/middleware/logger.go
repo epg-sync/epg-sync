@@ -24,7 +24,8 @@ func RequestLogger() gin.HandlerFunc {
 			logger.String("path", c.Request.URL.Path),
 			logger.Int("status", status),
 			logger.Duration("latency", time.Since(start)),
-			logger.String("ip", c.ClientIP()),
+			logger.String("ip", clientIP(c)),
+			logger.String("user_agent", c.Request.UserAgent()),
 		}
 		if q := c.Request.URL.RawQuery; q != "" {
 			fields = append(fields, logger.String("query", q))
@@ -46,6 +47,15 @@ func RequestLogger() gin.HandlerFunc {
 			log.Info(msg, fields...)
 		}
 	}
+}
+
+// clientIP 返回真实客户端 IP。服务部署在 Cloudflare 后面，RemoteAddr / X-Forwarded-For 拿到的是 CF 节点，
+// 所以优先取 CF-Connecting-IP，没有这个头（例如本地直连）时退回 gin 的 ClientIP()
+func clientIP(c *gin.Context) string {
+	if ip := strings.TrimSpace(c.GetHeader("CF-Connecting-IP")); ip != "" {
+		return ip
+	}
+	return c.ClientIP()
 }
 
 func isLogViewerRequest(c *gin.Context) bool {
