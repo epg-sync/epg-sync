@@ -176,17 +176,19 @@ func (s *EPGService) SyncEPG(ctx context.Context, channelID string, startDate, e
 	return nil
 }
 
-func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*model.ChannelMappingInfo, startDate, endDate time.Time, forceUpdate bool) error {
+// SyncEPGBatch 为还没有节目的频道抓取并保存节目单，已有节目（不论来自哪个 provider）的频道跳过。
+// 按优先级依次对各 provider 调用，就实现了「优先级高的先填」；强制刷新见 RefreshEPGBatch
+func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*model.ChannelMappingInfo, startDate, endDate time.Time) error {
 	if len(channelMappingInfos) == 0 {
 		logger.Info("No channel mappings provided, skipping EPG sync")
 		return nil
 	}
 
 	logger.Info("Syncing EPG batch",
+		logger.String("provider_id", channelMappingInfos[0].ProviderID),
 		logger.Int("channel_count", len(channelMappingInfos)),
 		logger.Time("start_date", startDate),
 		logger.Time("end_date", endDate),
-		logger.Bool("force_update", forceUpdate),
 	)
 
 	dates := s.getDatesInRange(startDate, endDate)
@@ -194,20 +196,6 @@ func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*mo
 		s.cache.Delete(ctx, "xmltv_epg:"+date.Format("2006-01-02"))
 		programsToSave := make([]*model.Program, 0)
 		cmInfosToSync := make([]*model.ChannelMappingInfo, 0)
-		if forceUpdate {
-			providerID := channelMappingInfos[0].ProviderID
-			logger.Debug("Force update enabled, deleting existing EPG for date",
-				logger.Time("date", date),
-				logger.String("providerID", providerID),
-			)
-			if err := s.programRepo.DeleteByDateAndProviderID(ctx, date, providerID); err != nil {
-				logger.Warn("Failed to delete existing EPG before update",
-					logger.Err(err),
-					logger.Time("date", date),
-					logger.String("providerID", providerID),
-				)
-			}
-		}
 
 		for _, cmInfo := range channelMappingInfos {
 			channelID := cmInfo.CanonicalID
@@ -277,6 +265,79 @@ func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*mo
 
 	return nil
 
+}
+
+// RefreshEPGBatch 强制刷新 p 负责的频道的节目单：先抓取，抓到数据的频道再在一个事务里
+// 删除当天全部旧节目（不分 provider）并写入新节目；抓取失败或没有数据的频道保留旧数据。
+//
+// 调用方按优先级从高到低依次对各 provider 调用，并共用同一个 replaced：
+// 某个频道某天被更高优先级的 provider 刷新过后，记入 replaced，低优先级的 provider 不再处理它。
+// 这样频道最终用的是优先级最高、且这次抓取成功的 provider 的数据。
+func (s *EPGService) RefreshEPGBatch(ctx context.Context, p provider.Provider, channelMappingInfos []*model.ChannelMappingInfo, startDate, endDate time.Time, replaced map[string]bool) {
+	for _, date := range s.getDatesInRange(startDate, endDate) {
+		s.cache.Delete(ctx, "xmltv_epg:"+date.Format("2006-01-02"))
+
+		pending := make([]*model.ChannelMappingInfo, 0, len(channelMappingInfos))
+		for _, info := range channelMappingInfos {
+			if !replaced[refreshKey(info.CanonicalID, date)] {
+				pending = append(pending, info)
+			}
+		}
+		if len(pending) == 0 {
+			continue
+		}
+
+		// 部分频道失败时，FetchEPGBatch 仍返回其余频道的节目，错误只用于记录
+		programs, err := p.FetchEPGBatch(ctx, pending, date)
+		if err != nil {
+			logger.Warn("Some channels failed to fetch during refresh",
+				logger.String("provider_id", p.GetID()),
+				logger.Time("date", date),
+				logger.Err(err),
+			)
+		}
+
+		byChannel := make(map[string][]*model.Program)
+		for _, program := range programs {
+			byChannel[program.ChannelID] = append(byChannel[program.ChannelID], program)
+		}
+
+		refreshed := 0
+		for _, info := range pending {
+			channelPrograms := byChannel[info.CanonicalID]
+			if len(channelPrograms) == 0 {
+				logger.Warn("No EPG fetched during refresh, keeping existing programs",
+					logger.String("provider_id", p.GetID()),
+					logger.String("channel_id", info.CanonicalID),
+					logger.Time("date", date),
+				)
+				continue
+			}
+			if err := s.programRepo.ReplaceChannelDay(ctx, info.CanonicalID, date, channelPrograms); err != nil {
+				logger.Error("Failed to replace programs",
+					logger.String("provider_id", p.GetID()),
+					logger.String("channel_id", info.CanonicalID),
+					logger.Time("date", date),
+					logger.Err(err),
+				)
+				continue
+			}
+			replaced[refreshKey(info.CanonicalID, date)] = true
+			s.cache.Delete(ctx, s.buildCacheKey(info.CanonicalID, date))
+			refreshed++
+		}
+
+		logger.Info("Refreshed EPG batch",
+			logger.String("provider_id", p.GetID()),
+			logger.Time("date", date),
+			logger.Int("channel_count", len(pending)),
+			logger.Int("refreshed", refreshed),
+		)
+	}
+}
+
+func refreshKey(channelID string, date time.Time) string {
+	return channelID + "|" + date.Format("2006-01-02")
 }
 
 func (s *EPGService) CleanupOldEPG(ctx context.Context, keepDays int) (int64, error) {

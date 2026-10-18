@@ -192,29 +192,33 @@ func (r *programRepo) DeleteBefore(ctx context.Context, before time.Time) (int64
 	return result.RowsAffected, nil
 }
 
-func (r *programRepo) DeleteByDateAndProviderID(ctx context.Context, date time.Time, providerID string) error {
+func (r *programRepo) ReplaceChannelDay(ctx context.Context, channelID string, date time.Time, programs []*model.Program) error {
 	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
 	endOfDay := startOfDay.Add(24 * time.Hour)
-	startOfDay = startOfDay.In(time.UTC)
-	endOfDay = endOfDay.In(time.UTC)
-	result := r.db.WithContext(ctx).
-		Where("provider_id = ? AND start_time >= ? AND start_time < ?", providerID, startOfDay, endOfDay).
-		Delete(&model.Program{})
-	if result.Error != nil {
-		logger.Error("Failed to delete programs by date",
-			logger.Err(result.Error),
-			logger.String("provider_id", providerID),
-			logger.Time("date", date),
-		)
-		return errors.Wrap(result.Error, errors.ErrCodeDatabaseQuery, "failed to delete programs")
+
+	var deleted int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("channel_id = ? AND start_time >= ? AND start_time < ?", channelID, startOfDay, endOfDay).
+			Delete(&model.Program{})
+		if result.Error != nil {
+			return result.Error
+		}
+		deleted = result.RowsAffected
+		if len(programs) == 0 {
+			return nil
+		}
+		return tx.CreateInBatches(programs, 1000).Error
+	})
+	if err != nil {
+		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to replace programs")
 	}
 
-	logger.Debug("Deleted programs by date",
+	logger.Debug("Replaced programs",
+		logger.String("channel_id", channelID),
 		logger.Time("date", date),
-		logger.String("provider_id", providerID),
-		logger.Int64("count", result.RowsAffected),
+		logger.Int64("deleted", deleted),
+		logger.Int("inserted", len(programs)),
 	)
-
 	return nil
 }
 
