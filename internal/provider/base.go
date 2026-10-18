@@ -38,6 +38,7 @@ func NewBaseProvider(config *model.ProviderConfig, channels []*model.ProviderCha
 	}
 
 	httpClient := NewHTTPClient(config.BaseURL, timeout)
+	httpClient.SetMaxRetries(config.MaxRetries)
 
 	return &BaseProvider{
 		config:     config,

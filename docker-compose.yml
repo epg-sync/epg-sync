@@ -18,6 +18,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # 容器的 resolv.conf 默认照抄宿主机的 options。有的 VPS 镜像带 timeout:1 attempts:1，
+    # 而海外上游 DNS 第一次解析国内域名常要 1.5~2s，Go 解析器 1 秒就放弃且不重试，
+    # 同步时就会报 lookup ... on 127.0.0.11:53: i/o timeout。这里恢复成 glibc/Go 的默认值。
+    # timeout 要大于 Docker 内置 DNS 对单个上游的 4s 超时，它才来得及换下一个上游重试
+    dns_opt:
+      - timeout:5
+      - attempts:2
     # 只有带这两个 label 的容器会被本项目的 watchtower 自动更新
     labels:
       com.centurylinklabs.watchtower.enable: "true"
