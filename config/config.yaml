@@ -11,6 +11,7 @@
 # logger:
 #   level: debug
 #   output: both            # 同时写入 logs/epgsync.log
+#   retention_days: 30      # 管理后台「系统日志」保留天数
 #
 # providers:                # 以 provider id 为 key，只写要覆盖的字段
 #   ysp:

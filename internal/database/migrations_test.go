@@ -116,8 +116,8 @@ func TestFixCGTNDocumentaryDownUp(t *testing.T) {
 	if _, err := p.Up(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Down(ctx); err != nil {
-		t.Fatalf("down: %v", err)
+	if _, err := p.DownTo(ctx, 3); err != nil {
+		t.Fatalf("down to 3: %v", err)
 	}
 	assertCount(t, db, `SELECT count(*) FROM channels WHERE channel_id = 'CGTN记录'`, 1)
 	if _, err := p.Up(ctx); err != nil {

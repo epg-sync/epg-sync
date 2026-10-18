@@ -20,6 +20,7 @@ import (
 
 type App struct {
 	cfg           *config.AppConfig
+	logHub        *logger.Hub
 	db            *gorm.DB
 	cache         cache.Cache
 	repos         *Repositories
@@ -34,6 +35,7 @@ type Repositories struct {
 	ChannelMappings repository.ChannelMappingsRepository
 	Timezone        repository.TimezoneRepository
 	User            repository.UserRepository
+	Log             repository.LogRepository
 }
 
 type Services struct {
@@ -42,11 +44,14 @@ type Services struct {
 	ChannelMapping *service.ChannelMappingService
 	Scheduler      *service.SchedulerService
 	User           *service.UserService
+	Log            *service.LogService
 }
 
-func New(cfg *config.AppConfig) (*App, error) {
+// New 创建应用。logHub 是 logger 的日志缓冲，连上数据库后开始把其中的日志写入数据库供管理后台查看
+func New(cfg *config.AppConfig, logHub *logger.Hub) (*App, error) {
 	app := &App{
-		cfg: cfg,
+		cfg:    cfg,
+		logHub: logHub,
 	}
 
 	if err := app.initialize(); err != nil {
@@ -76,6 +81,9 @@ func (app *App) initialize() error {
 		return fmt.Errorf("init provider chain: %w", err)
 	}
 
+	// 启动以来的日志都在 logHub 的缓冲区里，开始写入后会一并保存
+	app.services.Log.Start()
+
 	if err := app.autoMapProviderChannels(); err != nil {
 		return fmt.Errorf("auto map provider channels: %w", err)
 	}
@@ -93,6 +101,7 @@ func (app *App) Start() error {
 		epgHandler := handler.NewEPGHandler(app.services.EPG)
 		schedulerHandler := handler.NewSchedulerHandler(app.services.Scheduler)
 		authHandler := handler.NewAuthHandler(app.services.User)
+		logHandler := handler.NewLogHandler(app.services.Log)
 
 		if app.cfg.Server.Mode == "release" {
 			gin.SetMode(gin.ReleaseMode)
@@ -104,6 +113,7 @@ func (app *App) Start() error {
 			epgHandler,
 			schedulerHandler,
 			authHandler,
+			logHandler,
 		)
 
 		app.services.Scheduler.Start()
@@ -135,6 +145,11 @@ func (app *App) Stop() {
 
 	if err := app.server.Shutdown(ctx); err != nil {
 		logger.Error("Failed to shutdown HTTP server", logger.Err(err))
+	}
+
+	// 先把缓冲区里的日志写完，再关闭数据库
+	if app.services != nil && app.services.Log != nil {
+		app.services.Log.Stop()
 	}
 
 	if app.db != nil {

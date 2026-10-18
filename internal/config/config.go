@@ -69,6 +69,8 @@ type ServerConfig struct {
 
 	// 环境变量 JWT_SECRET；为空时首次启动自动生成并保存到数据库
 	JWTSecret string `yaml:"-"`
+	// 环境变量 ADMIN_PASSWORD；只在首次启动创建管理员时使用，为空时随机生成
+	AdminPassword string `yaml:"-"`
 }
 
 type DatabaseConfig struct {
@@ -174,6 +176,7 @@ func (c *AppConfig) applyEnv() error {
 		"POSTGRES_DB":       &c.Database.Name,
 		"POSTGRES_SSLMODE":  &c.Database.SSLMode,
 		"JWT_SECRET":        &c.Server.JWTSecret,
+		"ADMIN_PASSWORD":    &c.Server.AdminPassword,
 	} {
 		if v := os.Getenv(name); v != "" {
 			*dst = v

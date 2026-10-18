@@ -36,6 +36,7 @@ func Default(env Env) *AppConfig {
 			MaxAge:           30,
 			EnableStackTrace: true,
 			StackTraceLevel:  logger.ErrorLevel,
+			RetentionDays:    30,
 		},
 	}
 }

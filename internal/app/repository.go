@@ -14,6 +14,7 @@ func (app *App) initializeRepositories() error {
 		ChannelMappings: postgres.NewChannelMappingsRepository(app.db),
 		Timezone:        postgres.NewTimezoneRepository(app.db),
 		User:            postgres.NewUserRepository(app.db),
+		Log:             postgres.NewLogRepository(app.db),
 	}
 
 	return nil

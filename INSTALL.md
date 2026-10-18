@@ -40,7 +40,9 @@ Check the logs to confirm it is running:
 docker compose logs -f epg-sync
 ```
 
-The startup log prints the effective configuration, for example `env=prod config_files=[] database=postgres@db:5432/postgres`. On first start it also prints the default admin password (`Default admin created. User: admin, Pass: ...`).
+The startup log prints the effective configuration, for example `env=prod config_files=[] database=postgres@db:5432/postgres`.
+
+On first start the admin user `admin` is created and its password is printed in the startup output inside a box (`Default admin created`). To choose the password yourself, set `ADMIN_PASSWORD=...` in `.env` before the first start. The password only appears in the startup output (`docker compose logs`), never in log files or the admin panel's System Logs. The startup output is gone once the container is recreated; if you lose the password, see "Reset the admin password" below.
 
 ### Automatic updates and rollback
 
@@ -49,7 +51,7 @@ The startup log prints the effective configuration, for example `env=prod config
   - It uses the scope `epg-sync`, so it leaves other projects' containers on the server alone.
 - **Run `docker compose up -d` after editing `.env`**: watchtower recreates the container with the old container's environment, and `docker restart` doesn't re-read `.env` either.
 - **Rollback**: set `IMAGE_TAG=0.1.0` (the version to go back to) in `.env`, then run `docker compose up -d`. A fixed version tag never changes, so automatic updates pause as well. Remove the line and run `docker compose up -d` again to follow the latest version.
-- **Logs**: after a container is recreated, `docker logs` only shows the new container's output. To keep history across versions, set `logger.output: both` in `./config/config.yaml`, which writes logs to `./logs`.
+- **Logs**: after a container is recreated, `docker logs` only shows the new container's output. Application logs are also stored in the database, so they remain available under System Logs in the admin panel after upgrades (kept for 30 days by default, see `logger.retention_days`).
 
 ## 2. Configuration
 
@@ -86,6 +88,7 @@ The full list is also in [`.env.example`](.env.example); the values in its comme
 | `POSTGRES_SSLMODE` | `disable` | Set to `require` for an external database |
 | `APP_ENV` | `prod` | `prod` or `dev`. `dev` also reads `config/config.dev.yaml`. Always `prod` in Docker |
 | `JWT_SECRET` | empty | Login token signing secret. If empty, one is generated on first start and stored in the database, so logins stay valid across restarts |
+| `ADMIN_PASSWORD` | empty | Password for the `admin` user created on first start. If empty, a random one is generated and printed in the startup output. Only used while the database has no users |
 | `IMAGE_TAG` | `latest` | Used by docker compose only: the application image version. Set a version number to roll back, which also pauses automatic updates |
 | `DOCKER_API_VERSION` | `1.40` | Used by docker compose only: the Docker API version watchtower uses; lower it for older Docker Engines |
 
@@ -102,7 +105,7 @@ Only write the settings you want to change; see [`config/config.yaml`](config/co
 | `server.timeout` | `90` | HTTP read/write timeout, in seconds |
 | `server.jwt_expire_hours` | `24` | Login lifetime, in hours |
 | `database.max_open_conns` | `10` | Maximum open database connections |
-| `database.debug` | `false` | Log SQL statements |
+| `database.debug` | `false` | Log every SQL statement (also needs `logger.level: debug`). Failed statements and queries slower than 500ms are logged either way |
 | `logger.level` | `info` | `debug` / `info` / `warn` / `error` |
 | `logger.format` | `console` | `console` / `json` |
 | `logger.output` | `stdout` | `stdout` / `stderr` / `file` / `both` |
@@ -111,6 +114,7 @@ Only write the settings you want to change; see [`config/config.yaml`](config/co
 | `logger.max_backups` | `10` | Number of old log files to keep |
 | `logger.max_age` | `30` | Days to keep old log files |
 | `logger.compress` | `false` | Compress old log files |
+| `logger.retention_days` | `30` | Days to keep the admin panel's System Logs (stored in the database); `0` keeps them forever |
 | `logger.enable_caller` | `false` | Log the calling location |
 | `logger.enable_stack_trace` | `true` | Log stack traces |
 | `logger.stack_trace_level` | `error` | Lowest level that gets a stack trace |
@@ -153,7 +157,7 @@ Older versions used MySQL / SQLite and Redis. This version only uses PostgreSQL,
 
 - **Programs**: fetched again after the new version starts.
 - **Channel mappings**: regenerated automatically on startup.
-- **Admin account**: recreated; the password is in the first startup log.
+- **Admin account**: recreated; the password is in the first startup output, or set it in advance with `ADMIN_PASSWORD`.
 - **Custom channels**: the built-in channels are created automatically. If you added or edited channels in the old version, export them through the API and import them into the new one. Existing channels are updated:
 
 ```bash
@@ -233,9 +237,29 @@ The web admin panel runs on port 3000. Open in your browser:
 http://<server-ip>:3000
 ```
 
-The username is `admin`, and the initial password is generated in the startup log. Change it after your first login.
+The username is `admin`. The initial password is in the first startup output (`docker compose logs epg-sync`), or is the `ADMIN_PASSWORD` you set in `.env`. Change it under Account Settings after your first login.
 
 After logging in you can manage channels, view program schedules, and sync EPG data.
+
+### System logs
+
+The admin panel's System Logs page shows every application log entry, including sync jobs, provider errors, HTTP requests and database errors:
+
+- Filter by level, source (app / HTTP / database) and time range, and search messages and fields (channel names, provider IDs and so on)
+- Click an entry to expand all of its fields, the code location and the stack trace
+- Turn on Live to fetch new entries every 3 seconds
+
+These are the same entries as `docker compose logs`, stored in structured form in the database's `logs` table and cleaned up according to `logger.retention_days`.
+
+### Reset the admin password
+
+If you forget the password, or can no longer find the first startup output, run this on the server:
+
+```bash
+docker compose exec epg-sync /app/epg-sync reset-admin-password
+```
+
+It generates and prints a new random password. You can also pass the new password directly: `... reset-admin-password 'new-password'` (it will stay in your shell history).
 
 ## 7. EPG Endpoints
 

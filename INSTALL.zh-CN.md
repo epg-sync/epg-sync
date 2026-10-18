@@ -40,7 +40,9 @@ docker compose up -d
 docker compose logs -f epg-sync
 ```
 
-启动日志会打印实际生效的配置，例如 `env=prod config_files=[] database=postgres@db:5432/postgres`。首次启动时还会打印默认管理员密码（`Default admin created. User: admin, Pass: ...`）。
+启动日志会打印实际生效的配置，例如 `env=prod config_files=[] database=postgres@db:5432/postgres`。
+
+首次启动时会创建管理员 `admin`，密码打印在启动输出里，用框线标出（`Default admin created`）。想自己指定密码，在首次启动前往 `.env` 里写 `ADMIN_PASSWORD=...`。这个密码只打印在启动输出（`docker compose logs`）中，不会写进日志文件和管理后台的「系统日志」。容器重建后启动输出就没有了，忘记密码时见下文「重置管理员密码」。
 
 ### 自动更新与回滚
 
@@ -49,7 +51,7 @@ docker compose logs -f epg-sync
   - 它使用 scope `epg-sync`，不会动服务器上其它项目的容器。
 - **修改 `.env` 后要执行 `docker compose up -d`**：watchtower 重建容器时沿用旧容器的环境变量，`docker restart` 也不会重新读取 `.env`。
 - **回滚**：在 `.env` 里写 `IMAGE_TAG=0.1.0`（要回到的版本），再执行 `docker compose up -d`。固定版本的镜像不会再变，自动更新也就暂停了。删掉这一行再执行一次 `docker compose up -d`，即恢复跟随最新版本。
-- **日志**：重建容器后，`docker logs` 只剩新容器的输出。需要跨版本的历史日志时，在 `./config/config.yaml` 里设置 `logger.output: both`，日志会写入 `./logs`。
+- **日志**：重建容器后，`docker logs` 只剩新容器的输出。程序日志同时保存在数据库里，升级后仍能在管理后台的「系统日志」中查看（默认保留 30 天，见 `logger.retention_days`）。
 
 ## 2. 配置说明
 
@@ -86,6 +88,7 @@ docker compose logs -f epg-sync
 | `POSTGRES_SSLMODE` | `disable` | 连接外部数据库时可设为 `require` |
 | `APP_ENV` | `prod` | `prod` 或 `dev`。`dev` 时额外读取 `config/config.dev.yaml`。Docker 中固定为 `prod` |
 | `JWT_SECRET` | 空 | 登录令牌的签名密钥。为空时首次启动自动生成并保存到数据库，重启后登录状态不会失效 |
+| `ADMIN_PASSWORD` | 空 | 首次启动时管理员 `admin` 的密码。为空时随机生成并打印在启动输出里。只在数据库里还没有用户时生效 |
 | `IMAGE_TAG` | `latest` | 仅 docker compose 使用：程序镜像版本。设为具体版本号即回滚，并暂停自动更新 |
 | `DOCKER_API_VERSION` | `1.40` | 仅 docker compose 使用：watchtower 调用的 Docker API 版本，Docker Engine 较旧时可调低 |
 
@@ -102,7 +105,7 @@ docker compose logs -f epg-sync
 | `server.timeout` | `90` | HTTP 读写超时，单位秒 |
 | `server.jwt_expire_hours` | `24` | 登录有效期，单位小时 |
 | `database.max_open_conns` | `10` | 数据库最大连接数 |
-| `database.debug` | `false` | 是否打印 SQL |
+| `database.debug` | `false` | 记录每条 SQL（还需要 `logger.level: debug`）。不开启时也会记录出错的 SQL 和超过 500ms 的慢查询 |
 | `logger.level` | `info` | `debug` / `info` / `warn` / `error` |
 | `logger.format` | `console` | `console` / `json` |
 | `logger.output` | `stdout` | `stdout` / `stderr` / `file` / `both` |
@@ -111,6 +114,7 @@ docker compose logs -f epg-sync
 | `logger.max_backups` | `10` | 保留的旧日志文件数 |
 | `logger.max_age` | `30` | 旧日志保留天数 |
 | `logger.compress` | `false` | 是否压缩旧日志 |
+| `logger.retention_days` | `30` | 管理后台「系统日志」（保存在数据库中）的保留天数，`0` 表示不清理 |
 | `logger.enable_caller` | `false` | 是否记录调用位置 |
 | `logger.enable_stack_trace` | `true` | 是否记录堆栈 |
 | `logger.stack_trace_level` | `error` | 从哪个级别开始记录堆栈 |
@@ -153,7 +157,7 @@ docker compose exec db psql -U postgres
 
 - **节目单**：新版本启动后会重新抓取。
 - **频道映射**：启动时自动重新生成。
-- **管理员账号**：会重新生成，密码见首次启动日志。
+- **管理员账号**：会重新创建，密码见首次启动输出，或提前用 `ADMIN_PASSWORD` 指定。
 - **自定义频道**：内置频道会自动写入。如果你在旧版本里新增或修改过频道，可以用接口导出再导入，已存在的频道会被更新：
 
 ```bash
@@ -233,9 +237,29 @@ Web 管理面板运行在 3000 端口。打开浏览器，访问：
 http://<服务器IP>:3000
 ```
 
-登录用户名是 `admin`，初始密码会在启动日志中生成，请查看日志获取。首次登录后建议立即修改密码。
+登录用户名是 `admin`，初始密码见首次启动输出（`docker compose logs epg-sync`），或你在 `.env` 中设置的 `ADMIN_PASSWORD`。首次登录后建议在「账户设置」里修改密码。
 
 你可以在登录后管理节目频道、查看节目单、同步节目单等操作。
+
+### 系统日志
+
+管理后台的「系统日志」页面可以查看程序的每一条日志，包括同步任务、抓取源的报错、HTTP 请求和数据库错误：
+
+- 按级别、来源（业务 / HTTP / 数据库）、时间范围筛选，按关键字搜索消息和字段（如频道名、数据源 ID）
+- 点击一条日志展开全部字段、代码位置和错误堆栈
+- 打开「实时刷新」后每 3 秒自动拉取新日志
+
+这些日志和 `docker compose logs` 是同一份，只是以结构化的形式另存在数据库的 `logs` 表中，按 `logger.retention_days` 定期清理。
+
+### 重置管理员密码
+
+忘记密码，或者首次启动的输出已经找不到时，在服务器上执行：
+
+```bash
+docker compose exec epg-sync /app/epg-sync reset-admin-password
+```
+
+会生成一个新的随机密码并打印出来。也可以直接指定新密码：`... reset-admin-password '新密码'`（会留在 shell 历史里）。
 
 ## 7. 获取节目单接口
 

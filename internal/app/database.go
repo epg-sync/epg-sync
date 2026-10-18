@@ -29,7 +29,7 @@ func (app *App) initializeDatabase() error {
 		return err
 	}
 
-	if err := seedDefaultData(db); err != nil {
+	if err := seedDefaultData(db, app.cfg.Server.AdminPassword); err != nil {
 		logger.Error("Failed to seed default data", logger.Err(err))
 	}
 
@@ -49,29 +49,44 @@ func (app *App) initializeDatabase() error {
 	return nil
 }
 
-func seedDefaultData(db *gorm.DB) error {
+// seedDefaultData 在没有任何用户时创建管理员 admin。
+// 密码取 ADMIN_PASSWORD，未设置时随机生成并打印到 stdout（docker logs 能看到）。
+func seedDefaultData(db *gorm.DB, initialPassword string) error {
 	var count int64
-	db.Model(&model.User{}).Count(&count)
-
-	if count == 0 {
-		logger.Info("No users found, creating default admin user...")
-
-		randomPassword, err := utils.GenerateRandomString(14)
-		if err != nil {
-			return err
-		}
-		hashedPassword, _ := utils.HashPassword(string(randomPassword))
-		admin := model.User{
-			Username: "admin",
-			Password: hashedPassword,
-			Role:     "admin",
-			IsActive: 1,
-		}
-		if err := db.Create(&admin).Error; err != nil {
-			return err
-		}
-		logger.Info(fmt.Sprintf("Default admin created. User: admin, Pass: %s", randomPassword))
+	if err := db.Model(&model.User{}).Count(&count).Error; err != nil {
+		return err
 	}
+	if count > 0 {
+		return nil
+	}
+
+	password := initialPassword
+	if password == "" {
+		var err error
+		if password, err = utils.GenerateRandomString(14); err != nil {
+			return err
+		}
+	}
+	hashedPassword, err := utils.HashPassword(password)
+	if err != nil {
+		return err
+	}
+	admin := model.User{
+		Username: adminUsername,
+		Password: hashedPassword,
+		Role:     "admin",
+		IsActive: 1,
+	}
+	if err := db.Create(&admin).Error; err != nil {
+		return err
+	}
+
+	if initialPassword != "" {
+		logger.Info("Default admin created with password from ADMIN_PASSWORD", logger.String("username", adminUsername))
+		return nil
+	}
+	printCredentials("Default admin created", adminUsername, password)
+	logger.Info("Default admin created with a random password, see the startup output", logger.String("username", adminUsername))
 	return nil
 }
 
