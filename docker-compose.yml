@@ -23,7 +23,7 @@ services:
       com.centurylinklabs.watchtower.enable: "true"
       com.centurylinklabs.watchtower.scope: epg-sync
     # 镜像更新是重建容器，docker logs 只保留当前容器的输出。
-    # 需要跨版本的历史日志时，在 config/config.yaml 里设 logger.output: both，写入 ./logs
+    # 程序日志同时保存在数据库中，升级后仍可在管理后台「系统日志」查看
     logging:
       driver: json-file
       options:

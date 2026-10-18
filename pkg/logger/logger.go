@@ -42,6 +42,7 @@ type Logger interface {
 	Panicf(format string, args ...interface{})
 
 	With(fields ...Field) Logger
+	Named(name string) Logger
 	WithContext(ctx context.Context) Logger
 	Sync() error
 }
@@ -84,6 +85,9 @@ type Config struct {
 	EnableCaller     bool   `json:"enable_caller" yaml:"enable_caller"`
 	EnableStackTrace bool   `json:"enable_stack_trace" yaml:"enable_stack_trace"`
 	StackTraceLevel  Level  `json:"stack_trace_level" yaml:"stack_trace_level"`
+
+	// 管理后台日志（保存在数据库中）的保留天数
+	RetentionDays int `json:"retention_days" yaml:"retention_days"`
 }
 
 func DefaultConfig() *Config {
@@ -106,15 +110,16 @@ var (
 	once         sync.Once
 )
 
-func Init(cfg *Config) error {
+// Init 初始化全局 logger，extra 是额外并列的输出（例如 Hub.Core）
+func Init(cfg *Config, extra ...zapcore.Core) error {
 	var err error
 	once.Do(func() {
-		globalLogger, err = NewLogger(cfg)
+		globalLogger, err = NewLogger(cfg, extra...)
 	})
 	return err
 }
 
-func NewLogger(cfg *Config) (Logger, error) {
+func NewLogger(cfg *Config, extra ...zapcore.Core) (Logger, error) {
 	if cfg == nil {
 		cfg = DefaultConfig()
 	}
@@ -189,8 +194,11 @@ func NewLogger(cfg *Config) (Logger, error) {
 	core := zapcore.NewCore(
 		encoder,
 		zapcore.NewMultiWriteSyncer(writers...),
-		parseLogLevel(cfg.Level),
+		ParseLevel(cfg.Level),
 	)
+	if len(extra) > 0 {
+		core = zapcore.NewTee(append([]zapcore.Core{core}, extra...)...)
+	}
 
 	opts := []zap.Option{
 		zap.AddCallerSkip(1),
@@ -209,7 +217,7 @@ func NewLogger(cfg *Config) (Logger, error) {
 	return &zapLogger{
 		logger: zapLog,
 		sugar:  zapLog.Sugar(),
-		level:  parseLogLevel(cfg.Level),
+		level:  ParseLevel(cfg.Level),
 	}, nil
 }
 
@@ -270,9 +278,19 @@ func (l *zapLogger) Panicf(format string, args ...interface{}) {
 }
 
 func (l *zapLogger) With(fields ...Field) Logger {
+	with := l.logger.With(fields...)
 	return &zapLogger{
-		logger: l.logger.With(fields...),
-		sugar:  l.sugar.With(fields),
+		logger: with,
+		sugar:  with.Sugar(),
+		level:  l.level,
+	}
+}
+
+func (l *zapLogger) Named(name string) Logger {
+	named := l.logger.Named(name)
+	return &zapLogger{
+		logger: named,
+		sugar:  named.Sugar(),
 		level:  l.level,
 	}
 }
@@ -364,6 +382,10 @@ func With(fields ...Field) Logger {
 	return Default().With(fields...)
 }
 
+func Named(name string) Logger {
+	return Default().Named(name)
+}
+
 func WithContext(ctx context.Context) Logger {
 	return Default().WithContext(ctx)
 }
@@ -415,7 +437,8 @@ func NewTestLogger(w io.Writer) Logger {
 	}
 }
 
-func parseLogLevel(levelStr string) Level {
+// ParseLevel 把配置里的级别名转换成 Level，无法识别时为 info
+func ParseLevel(levelStr string) Level {
 	switch levelStr {
 	case "debug":
 		return DebugLevel
@@ -427,4 +450,9 @@ func parseLogLevel(levelStr string) Level {
 		return ErrorLevel
 	}
 	return InfoLevel
+}
+
+// ParseLevelStrict 与 ParseLevel 相同，但无法识别时返回错误
+func ParseLevelStrict(levelStr string) (Level, error) {
+	return zapcore.ParseLevel(levelStr)
 }

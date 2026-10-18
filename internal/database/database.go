@@ -33,7 +33,7 @@ func Open(ctx context.Context, cfg config.DatabaseConfig) (*gorm.DB, error) {
 		backoff = 500 * time.Millisecond
 	)
 	for {
-		db, err = gorm.Open(postgres.Open(cfg.URL), &gorm.Config{})
+		db, err = gorm.Open(postgres.Open(cfg.URL), &gorm.Config{Logger: newGormLogger(cfg.Debug)})
 		if err == nil {
 			break
 		}
@@ -58,10 +58,6 @@ func Open(ctx context.Context, cfg config.DatabaseConfig) (*gorm.DB, error) {
 	sqlDB.SetMaxOpenConns(maxOpen)
 	sqlDB.SetMaxIdleConns(maxOpen)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
-
-	if cfg.Debug {
-		db = db.Debug()
-	}
 
 	return db, nil
 }

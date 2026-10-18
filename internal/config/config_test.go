@@ -17,7 +17,7 @@ server:
 // clearEnv 清掉会影响配置加载的环境变量，避免受开发机环境干扰
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"APP_ENV", "JWT_SECRET", "POSTGRES_HOST", "POSTGRES_PORT",
+	for _, name := range []string{"APP_ENV", "JWT_SECRET", "ADMIN_PASSWORD", "POSTGRES_HOST", "POSTGRES_PORT",
 		"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB", "POSTGRES_SSLMODE"} {
 		t.Setenv(name, "")
 	}

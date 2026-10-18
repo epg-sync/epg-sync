@@ -11,6 +11,7 @@ import {
   RefreshCw,
   LogOut,
   Settings,
+  ScrollText,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
@@ -21,6 +22,7 @@ const navigation = [
   { name: '频道映射', href: '/mappings', icon: LinkIcon },
   { name: '节目管理', href: '/programs', icon: FileText },
   { name: 'EPG同步', href: '/sync', icon: RefreshCw },
+  { name: '系统日志', href: '/logs', icon: ScrollText },
   { name: '账户设置', href: '/settings', icon: Settings },
 ];
 

@@ -67,3 +67,9 @@ type UserRepository interface {
 	Delete(ctx context.Context, id int64) error
 	List(ctx context.Context, offset, limit int) ([]*model.User, int64, error)
 }
+
+type LogRepository interface {
+	CreateBatch(ctx context.Context, logs []*model.Log) error
+	List(ctx context.Context, filter model.LogFilter) ([]*model.Log, error)
+	DeleteBefore(ctx context.Context, before time.Time) (int64, error)
+}

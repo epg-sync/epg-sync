@@ -37,6 +37,18 @@ export interface Program {
   updated_at: string;
 }
 
+// 程序日志，level 为 zap 的级别值：-1 debug、0 info、1 warn、2 error、更大为 fatal
+export interface LogEntry {
+  id: number;
+  time: string;
+  level: number;
+  logger: string;
+  caller: string;
+  message: string;
+  fields: Record<string, unknown> | null;
+  stack: string;
+}
+
 export interface User {
   id: number;
   username: string;

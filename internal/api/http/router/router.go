@@ -14,11 +14,12 @@ func SetupRouter(
 	epgHandler *handler.EPGHandler,
 	schedulerHandler *handler.SchedulerHandler,
 	authHandler *handler.AuthHandler,
+	logHandler *handler.LogHandler,
 ) *gin.Engine {
 
 	router := gin.New()
-	router.Use(gin.Logger())
-	router.Use(gin.Recovery())
+	router.Use(middleware.RequestLogger())
+	router.Use(middleware.Recovery())
 	router.Use(corsMiddleware())
 
 	auth := router.Group("/auth")
@@ -47,6 +48,7 @@ func SetupRouter(
 
 		admin.POST("/job/sync", schedulerHandler.SyncAllEPG)
 
+		admin.GET("/logs", logHandler.ListLogs)
 	}
 
 	api := router.Group("/api")
