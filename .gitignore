@@ -1,6 +1,8 @@
 .air.toml
-tmp
-logs
+# 只忽略根目录下运行时生成的目录。不加 / 会匹配任意层级的同名目录，
+# 例如前端的 web/src/app/(dashboard)/logs/ 页面也会被忽略
+/tmp/
+/logs/
 .DS_Store
 scgd.json
 config/config.dev.yaml
