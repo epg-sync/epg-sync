@@ -128,13 +128,13 @@ Every built-in provider ships with its own defaults in code (base URL, priority,
 providers:
   ysp:
     enabled: false # disable the Yangshipin source
-  homeplus:
+  migu_tv:
     priority: 1 # lower values have higher priority
     rate_limit: 3 # maximum concurrent requests
     timeout: 15s
 ```
 
-Available provider ids: `bfgd` `btzx` `cctv_cn` `daxiang` `fengshow` `hainan` `hebei` `homeplus` `iqilu` `jsp` `jstv` `kknews` `migu_tv` `shanxi` `suzhou` `sxrtv` `xiamen` `ysp`
+Available provider ids: `bfgd` `btzx` `cctv_cn` `daxiang` `fengshow` `hainan` `hebei` `homeplus` `iqilu` `jsp` `jstv` `kknews` `migu_tv` `shanxi` `suzhou` `sxrtv` `vl` `xiamen` `ysp`
 
 ## 3. Browse the Database with a GUI Client
 

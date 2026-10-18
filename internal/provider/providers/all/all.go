@@ -19,6 +19,7 @@ import (
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/shanxi"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/suzhou"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/sxrtv"
+	_ "github.com/epg-sync/epgsync/internal/provider/providers/vl"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/xiamen"
 	_ "github.com/epg-sync/epgsync/internal/provider/providers/ysp"
 )

@@ -128,13 +128,13 @@ docker compose logs -f epg-sync
 providers:
   ysp:
     enabled: false # 禁用央视频源
-  homeplus:
+  migu_tv:
     priority: 1 # 优先级，数值越小优先级越高
     rate_limit: 3 # 最大同时请求数
     timeout: 15s
 ```
 
-可用的 provider id：`bfgd` `btzx` `cctv_cn` `daxiang` `fengshow` `hainan` `hebei` `homeplus` `iqilu` `jsp` `jstv` `kknews` `migu_tv` `shanxi` `suzhou` `sxrtv` `xiamen` `ysp`
+可用的 provider id：`bfgd` `btzx` `cctv_cn` `daxiang` `fengshow` `hainan` `hebei` `homeplus` `iqilu` `jsp` `jstv` `kknews` `migu_tv` `shanxi` `suzhou` `sxrtv` `vl` `xiamen` `ysp`
 
 ## 3. 用 GUI 客户端查看数据库
 
