@@ -52,11 +52,12 @@ var (
 	}
 )
 
+// 節目表与实际播出有出入，优先级放到最低，只作后备：緯來體育优先用官方的 vl
 func init() {
 	provider.Register(provider.Definition{
 		ID:         "homeplus",
 		BaseURL:    "https://www.homeplus.net.tw",
-		Priority:   2,
+		Priority:   5,
 		Timeout:    10 * time.Second,
 		RateLimit:  5,
 		MaxRetries: 2,

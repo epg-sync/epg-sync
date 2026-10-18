@@ -15,6 +15,6 @@
 # providers:                # 以 provider id 为 key，只写要覆盖的字段
 #   ysp:
 #     enabled: false
-#   homeplus:
+#   migu_tv:
 #     priority: 1
 #     rate_limit: 3

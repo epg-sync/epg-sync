@@ -49,3 +49,20 @@ func TestDefinitionsComplete(t *testing.T) {
 		}
 	}
 }
+
+// 緯來體育同时由 vl（官方）和 homeplus 提供，同步时按优先级先取 vl，
+// vl 没有数据时才用 homeplus（数字越小越优先）
+func TestVLPreferredOverHomeplus(t *testing.T) {
+	priority := make(map[string]int)
+	for _, def := range provider.Definitions() {
+		priority[def.ID] = def.Priority
+	}
+	vl, okVL := priority["vl"]
+	homeplus, okHP := priority["homeplus"]
+	if !okVL || !okHP {
+		t.Fatalf("vl registered %v, homeplus registered %v", okVL, okHP)
+	}
+	if vl >= homeplus {
+		t.Errorf("vl priority %d should be smaller than homeplus %d", vl, homeplus)
+	}
+}
