@@ -1,9 +1,11 @@
 package iqilu
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -153,11 +155,15 @@ func (p *IQiluProvider) ParseEPGResponse(data []byte, providerChannelID, channel
 	}
 
 	for _, programData := range resp.Data.Infos {
-		startTime := date + " " + strings.ReplaceAll(programData.StartTime, "：", ":")
-		endTime := date + " " + strings.ReplaceAll(programData.EndTime, "：", ":")
+		startClock, startErr := normalizeClock(programData.StartTime)
+		endClock, endErr := normalizeClock(programData.EndTime)
+		if err := cmp.Or(startErr, endErr); err != nil {
+			logger.Warn(errors.ErrProgramDateRangeProcess(err, channelID, date).Error())
+			continue
+		}
 
-		startTimeParsed, endTimeParsed, err := p.BaseProvider.ProcessProgramTimeRange(startTime, endTime, date, provider.TimeLayoutYYYYMMDDHHMMSS, location)
-
+		startTimeParsed, endTimeParsed, err := p.BaseProvider.ProcessProgramTimeRange(
+			date+" "+startClock, date+" "+endClock, date, provider.TimeLayoutYYYYMMDDHHMMSS, location)
 		if err != nil {
 			logger.Warn(errors.ErrProgramDateRangeProcess(err, channelID, date).Error())
 			continue
@@ -178,6 +184,33 @@ func (p *IQiluProvider) ParseEPGResponse(data []byte, providerChannelID, channel
 	}
 
 	return programs, nil
+}
+
+// normalizeClock 把接口返回的时刻统一成 HH:MM:SS。
+// 不同频道、不同日期的格式不一致：多数是 "06:30:00"，也有 "6:30"（2026-10-18 山东农科），
+// 还出现过全角冒号。"24:00" 表示当天结束，换成 23:59:59（结束时间本来也会被截到当天）
+func normalizeClock(s string) (string, error) {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "：", ":"))
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return "", fmt.Errorf("unrecognized time %q", s)
+	}
+	nums := make([]int, 3)
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 || len(part) > 2 {
+			return "", fmt.Errorf("unrecognized time %q", s)
+		}
+		nums[i] = n
+	}
+	h, m, sec := nums[0], nums[1], nums[2]
+	if h == 24 && m == 0 && sec == 0 {
+		return "23:59:59", nil
+	}
+	if h > 23 || m > 59 || sec > 59 {
+		return "", fmt.Errorf("time out of range %q", s)
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", h, m, sec), nil
 }
 
 func (p *Program) UnmarshalJSON(data []byte) error {

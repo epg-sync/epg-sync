@@ -258,7 +258,8 @@ func EPGNotFound(channelID string, date string) *AppError {
 }
 
 func ErrProgramDateRangeProcess(err error, channelID string, date string) *AppError {
-	return New(ErrCodeEPGInvalidDate, "failed to process program date range").
+	// 保留原始错误，日志里才能看到具体是哪个时间解析失败
+	return Wrap(err, ErrCodeEPGInvalidDate, "failed to process program date range").
 		WithDetails(map[string]any{
 			"channel_id": channelID,
 			"date":       date,
