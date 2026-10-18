@@ -36,7 +36,8 @@ type ProgramRepository interface {
 	ListAllByDateRange(ctx context.Context, start, end time.Time) ([]*model.Program, error)
 	GetCurrentProgram(ctx context.Context, channelID string) (*model.Program, error)
 	DeleteBefore(ctx context.Context, before time.Time) (int64, error)
-	DeleteByDateAndProviderID(ctx context.Context, date time.Time, providerID string) error
+	// ReplaceChannelDay 在一个事务中删除频道在 date 当天开始的全部节目（不分 provider），再写入 programs
+	ReplaceChannelDay(ctx context.Context, channelID string, date time.Time, programs []*model.Program) error
 	Exists(ctx context.Context, channelID string, date time.Time) (bool, error)
 }
 

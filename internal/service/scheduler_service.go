@@ -135,7 +135,10 @@ func (s *SchedulerService) SyncAllEPG(forceUpdate bool) {
 		logger.Bool("force_update", forceUpdate),
 	)
 
+	// 按优先级从高到低处理 provider（chain 已排好序）。
+	// 强制刷新时记录本轮已刷新的「频道|日期」，低优先级的 provider 不再覆盖，见 RefreshEPGBatch
 	providers := s.chain.GetProviders()
+	replaced := make(map[string]bool)
 
 	for _, p := range providers {
 		channelMappings, err := s.channelMappingService.ListChannels(ctx, p.GetID())
@@ -163,7 +166,12 @@ func (s *SchedulerService) SyncAllEPG(forceUpdate bool) {
 			continue
 		}
 
-		if err := s.epgService.SyncEPGBatch(ctx, channelMappingInfos, startDate, endDate, forceUpdate); err != nil {
+		if forceUpdate {
+			s.epgService.RefreshEPGBatch(ctx, p, channelMappingInfos, startDate, endDate, replaced)
+			continue
+		}
+
+		if err := s.epgService.SyncEPGBatch(ctx, channelMappingInfos, startDate, endDate); err != nil {
 			logger.Error("Failed to sync EPG batch",
 				logger.Err(err),
 				logger.String("provider_id", p.GetID()),
