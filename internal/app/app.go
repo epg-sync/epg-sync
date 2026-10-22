@@ -36,6 +36,7 @@ type Repositories struct {
 	Timezone        repository.TimezoneRepository
 	User            repository.UserRepository
 	Log             repository.LogRepository
+	CustomSource    repository.CustomSourceRepository
 }
 
 type Services struct {
@@ -45,6 +46,7 @@ type Services struct {
 	Scheduler      *service.SchedulerService
 	User           *service.UserService
 	Log            *service.LogService
+	CustomSource   *service.CustomSourceService
 }
 
 // New 创建应用。logHub 是 logger 的日志缓冲，连上数据库后开始把其中的日志写入数据库供管理后台查看
@@ -84,6 +86,10 @@ func (app *App) initialize() error {
 	// 启动以来的日志都在 logHub 的缓冲区里，开始写入后会一并保存
 	app.services.Log.Start()
 
+	if err := app.services.CustomSource.ResetStale(context.Background()); err != nil {
+		return fmt.Errorf("reset custom source status: %w", err)
+	}
+
 	if err := app.autoMapProviderChannels(); err != nil {
 		return fmt.Errorf("auto map provider channels: %w", err)
 	}
@@ -102,6 +108,7 @@ func (app *App) Start() error {
 		schedulerHandler := handler.NewSchedulerHandler(app.services.Scheduler)
 		authHandler := handler.NewAuthHandler(app.services.User)
 		logHandler := handler.NewLogHandler(app.services.Log)
+		customSourceHandler := handler.NewCustomSourceHandler(app.services.CustomSource)
 
 		if app.cfg.Server.Mode == "release" {
 			gin.SetMode(gin.ReleaseMode)
@@ -114,6 +121,7 @@ func (app *App) Start() error {
 			schedulerHandler,
 			authHandler,
 			logHandler,
+			customSourceHandler,
 		)
 
 		app.services.Scheduler.Start()

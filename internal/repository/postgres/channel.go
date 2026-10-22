@@ -105,6 +105,22 @@ func (r *channelRepo) GetByChannelName(ctx context.Context, channelName string) 
 
 }
 
+func (r *channelRepo) MatchByRegexp(ctx context.Context, channelName string) ([]*model.ChannelRegexpMatch, error) {
+	var matches []*model.ChannelRegexpMatch
+	// substring(... from pattern) 在 pattern 含括号时返回第一个括号匹配到的内容，
+	// 所以整体再包一层括号，取到的就是整段匹配；(?i) 与 ~* 一样不区分大小写
+	err := r.db.WithContext(ctx).
+		Model(&model.Channel{}).
+		Select("channels.*, substring(? from '(?i)(' || regexp || ')') AS matched", channelName).
+		Where("regexp <> '' AND ? ~* regexp", channelName).
+		Order("id").
+		Find(&matches).Error
+	if err != nil {
+		return nil, errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to match channel by regexp")
+	}
+	return matches, nil
+}
+
 func (r *channelRepo) Update(ctx context.Context, channel *model.Channel) error {
 	channel.UpdatedAt = time.Now()
 

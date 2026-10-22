@@ -15,6 +15,7 @@ func (app *App) initializeRepositories() error {
 		Timezone:        postgres.NewTimezoneRepository(app.db),
 		User:            postgres.NewUserRepository(app.db),
 		Log:             postgres.NewLogRepository(app.db),
+		CustomSource:    postgres.NewCustomSourceRepository(app.db),
 	}
 
 	return nil

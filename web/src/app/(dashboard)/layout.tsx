@@ -12,6 +12,7 @@ import {
   LogOut,
   Settings,
   ScrollText,
+  Database,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
@@ -20,6 +21,7 @@ import { useAuthStore } from '@/store/authStore';
 const navigation = [
   { name: '频道管理', href: '/channels', icon: Tv },
   { name: '频道映射', href: '/mappings', icon: LinkIcon },
+  { name: '数据源', href: '/custom-sources', icon: Database },
   { name: '节目管理', href: '/programs', icon: FileText },
   { name: 'EPG同步', href: '/sync', icon: RefreshCw },
   { name: '系统日志', href: '/logs', icon: ScrollText },

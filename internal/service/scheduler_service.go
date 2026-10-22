@@ -20,6 +20,7 @@ type SchedulerService struct {
 	channelService        *ChannelService
 	channelMappingService *ChannelMappingService
 	chain                 *provider.Chain
+	customSources         *CustomSourceService
 	mu                    sync.RWMutex
 	jobs                  map[string]cron.EntryID
 }
@@ -40,6 +41,12 @@ func NewSchedulerService(
 		jobs:                  make(map[string]cron.EntryID),
 		cache:                 cache,
 	}
+}
+
+// SetCustomSources 接入自定义数据源。设置后，每次 SyncAllEPG 都会在所有 provider 之后同步它们，
+// 所以自定义源始终最后写入、覆盖内置源
+func (s *SchedulerService) SetCustomSources(customSources *CustomSourceService) {
+	s.customSources = customSources
 }
 
 func (s *SchedulerService) Start() error {
@@ -177,6 +184,12 @@ func (s *SchedulerService) SyncAllEPG(forceUpdate bool) {
 				logger.String("provider_id", p.GetID()),
 			)
 		}
+	}
+
+	// 自定义源放在最后：同一频道同一时段以自定义源为准。
+	// 它下载失败时不会动数据，频道自然回退到上面刚写入的内置源数据
+	if s.customSources != nil {
+		s.customSources.SyncAll(ctx)
 	}
 
 	logger.Info("Completed scheduled EPG sync")

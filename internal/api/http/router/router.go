@@ -15,6 +15,7 @@ func SetupRouter(
 	schedulerHandler *handler.SchedulerHandler,
 	authHandler *handler.AuthHandler,
 	logHandler *handler.LogHandler,
+	customSourceHandler *handler.CustomSourceHandler,
 ) *gin.Engine {
 
 	router := gin.New()
@@ -47,6 +48,12 @@ func SetupRouter(
 		admin.POST("/epg/sync", epgHandler.SyncEPGByChannelAndDateRange)
 
 		admin.POST("/job/sync", schedulerHandler.SyncAllEPG)
+
+		admin.GET("/custom-sources", customSourceHandler.ListCustomSources)
+		admin.POST("/custom-sources", customSourceHandler.CreateCustomSource)
+		admin.PUT("/custom-sources/:id", customSourceHandler.UpdateCustomSource)
+		admin.DELETE("/custom-sources/:id", customSourceHandler.DeleteCustomSource)
+		admin.POST("/custom-sources/:id/sync", customSourceHandler.SyncCustomSource)
 
 		admin.GET("/logs", logHandler.ListLogs)
 	}
