@@ -38,7 +38,27 @@ type ProgramRepository interface {
 	DeleteBefore(ctx context.Context, before time.Time) (int64, error)
 	// ReplaceChannelDay 在一个事务中删除频道在 date 当天开始的全部节目（不分 provider），再写入 programs
 	ReplaceChannelDay(ctx context.Context, channelID string, date time.Time, programs []*model.Program) error
+	// ReplaceChannelRange 在一个事务中删除频道与 [from, to) 有重叠的全部节目（不分 provider），
+	// 以及 providerID 此前写入的、结束时间晚于 ownFrom 的节目（清理上次同步留下的旧数据），再写入 programs。
+	// 范围之外其它 provider 的节目原样保留
+	ReplaceChannelRange(ctx context.Context, channelID string, from, to time.Time, providerID string, ownFrom time.Time, programs []*model.Program) error
+	DeleteByProviderID(ctx context.Context, providerID string) (int64, error)
 	Exists(ctx context.Context, channelID string, date time.Time) (bool, error)
+}
+
+type CustomSourceRepository interface {
+	Repository
+
+	Create(ctx context.Context, source *model.CustomSource) error
+	List(ctx context.Context) ([]*model.CustomSource, error)
+	GetByID(ctx context.Context, id int64) (*model.CustomSource, error)
+	// Update 只更新 name / url / enabled / priority
+	Update(ctx context.Context, source *model.CustomSource) error
+	Delete(ctx context.Context, id int64) error
+	SetRunning(ctx context.Context, id int64) error
+	SetSyncResult(ctx context.Context, id int64, status, lastError string, programCount int) error
+	// ResetRunning 把进程中途退出留下的 running 状态改为 failed
+	ResetRunning(ctx context.Context) error
 }
 
 type ChannelMappingsRepository interface {

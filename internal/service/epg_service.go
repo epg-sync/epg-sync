@@ -86,7 +86,7 @@ func (s *EPGService) SyncEPG(ctx context.Context, channelID string, startDate, e
 	dates := s.getDatesInRange(startDate, endDate)
 
 	for _, date := range dates {
-		s.cache.Delete(ctx, "xmltv_epg:"+date.Format("2006-01-02"))
+		s.cache.Delete(ctx, xmltvCacheKey(date))
 		exists, err := s.programRepo.Exists(ctx, channelID, date)
 		if err != nil {
 			logger.Error("Failed to check EPG existence",
@@ -193,7 +193,7 @@ func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*mo
 
 	dates := s.getDatesInRange(startDate, endDate)
 	for _, date := range dates {
-		s.cache.Delete(ctx, "xmltv_epg:"+date.Format("2006-01-02"))
+		s.cache.Delete(ctx, xmltvCacheKey(date))
 		programsToSave := make([]*model.Program, 0)
 		cmInfosToSync := make([]*model.ChannelMappingInfo, 0)
 
@@ -275,7 +275,7 @@ func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*mo
 // 这样频道最终用的是优先级最高、且这次抓取成功的 provider 的数据。
 func (s *EPGService) RefreshEPGBatch(ctx context.Context, p provider.Provider, channelMappingInfos []*model.ChannelMappingInfo, startDate, endDate time.Time, replaced map[string]bool) {
 	for _, date := range s.getDatesInRange(startDate, endDate) {
-		s.cache.Delete(ctx, "xmltv_epg:"+date.Format("2006-01-02"))
+		s.cache.Delete(ctx, xmltvCacheKey(date))
 
 		pending := make([]*model.ChannelMappingInfo, 0, len(channelMappingInfos))
 		for _, info := range channelMappingInfos {
@@ -336,6 +336,11 @@ func (s *EPGService) RefreshEPGBatch(ctx context.Context, p provider.Provider, c
 	}
 }
 
+// xmltvCacheKey 是 /api/xmltv 输出的缓存键，只与「今天」有关
+func xmltvCacheKey(day time.Time) string {
+	return "xmltv_epg:" + day.Format("2006-01-02")
+}
+
 func refreshKey(channelID string, date time.Time) string {
 	return channelID + "|" + date.Format("2006-01-02")
 }
@@ -378,7 +383,7 @@ func (s *EPGService) GenerateXMLTVFormatPrograms(ctx context.Context) (*model.XM
 	now := time.Now()
 	startDate := now.AddDate(0, 0, -1)
 	endDate := now.AddDate(0, 0, 1)
-	cacheKey := fmt.Sprintf("xmltv_epg:%s", now.Format("2006-01-02"))
+	cacheKey := xmltvCacheKey(now)
 
 	var cachedXMLTV model.XMLTVEPG
 	err := s.cache.Get(ctx, cacheKey, &cachedXMLTV)

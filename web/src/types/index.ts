@@ -12,6 +12,20 @@ export interface Channel {
   updated_at: string;
 }
 
+export interface CustomSource {
+  id: number;
+  name: string;
+  url: string;
+  enabled: number;
+  priority: number;
+  last_sync_at: string | null;
+  last_status: "" | "running" | "success" | "failed";
+  last_error: string;
+  program_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ChannelMapping {
   id: number;
   canonical_id: string;

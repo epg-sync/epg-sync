@@ -1,0 +1,428 @@
+"use client"
+
+import { useState, useEffect, useCallback } from "react"
+import { Plus, Edit, Trash2, RefreshCw } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
+import { useToast } from "@/hooks/use-toast"
+import api from "@/lib/api"
+import type { CustomSource } from "@/types"
+
+const DEFAULT_PRIORITY = 100
+
+const emptyForm = {
+  name: "",
+  url: "",
+  enabled: 1,
+  priority: String(DEFAULT_PRIORITY),
+}
+
+const statusStyles: Record<string, { label: string; className: string }> = {
+  running: { label: "同步中", className: "bg-blue-100 text-blue-800" },
+  success: { label: "成功", className: "bg-green-100 text-green-800" },
+  failed: { label: "失败", className: "bg-red-100 text-red-800" },
+}
+
+export default function CustomSourcesPage() {
+  const [sources, setSources] = useState<CustomSource[]>([])
+  const [loading, setLoading] = useState(true)
+  const [isCreateOpen, setIsCreateOpen] = useState(false)
+  const [editingSource, setEditingSource] = useState<CustomSource | null>(null)
+  const [formData, setFormData] = useState(emptyForm)
+  const { toast } = useToast()
+
+  const errorText = (error: any, fallback: string) =>
+    error.response?.data?.error || error.response?.data?.message || fallback
+
+  const fetchSources = useCallback(async (): Promise<CustomSource[]> => {
+    const response: any = await api.get("/admin/custom-sources")
+    return response.data || []
+  }, [])
+
+  // 变更后和轮询时刷新列表。silent 时失败不弹提示（轮询每 2 秒一次，不能一直报错）
+  const loadSources = useCallback(
+    async (silent = false) => {
+      try {
+        setSources(await fetchSources())
+      } catch (error: any) {
+        if (!silent) {
+          toast({
+            variant: "destructive",
+            title: "加载失败",
+            description: errorText(error, "无法加载数据源列表"),
+          })
+        }
+      }
+    },
+    [fetchSources, toast]
+  )
+
+  useEffect(() => {
+    let active = true
+    fetchSources()
+      .then((list) => active && setSources(list))
+      .catch((error: any) => {
+        if (active) {
+          toast({
+            variant: "destructive",
+            title: "加载失败",
+            description: errorText(error, "无法加载数据源列表"),
+          })
+        }
+      })
+      .finally(() => active && setLoading(false))
+    return () => {
+      active = false
+    }
+  }, [fetchSources, toast])
+
+  // 有数据源正在同步时，每 2 秒静默刷新一次，直到同步结束
+  const hasRunning = sources.some((s) => s.last_status === "running")
+  useEffect(() => {
+    if (!hasRunning) return
+    const timer = setInterval(() => loadSources(true), 2000)
+    return () => clearInterval(timer)
+  }, [hasRunning, loadSources])
+
+  const closeDialog = () => {
+    setIsCreateOpen(false)
+    setEditingSource(null)
+    setFormData(emptyForm)
+  }
+
+  const openEdit = (source: CustomSource) => {
+    setEditingSource(source)
+    setFormData({
+      name: source.name,
+      url: source.url,
+      enabled: source.enabled,
+      priority: String(source.priority),
+    })
+  }
+
+  // 返回提交给后端的请求体；校验不通过时弹出提示并返回 null
+  const buildPayload = () => {
+    const name = formData.name.trim()
+    const url = formData.url.trim()
+    const priority = Number(formData.priority)
+    if (!name || !url) {
+      toast({ variant: "destructive", title: "请填写名称和地址" })
+      return null
+    }
+    if (!/^https?:\/\//i.test(url)) {
+      toast({ variant: "destructive", title: "地址必须以 http:// 或 https:// 开头" })
+      return null
+    }
+    if (!Number.isInteger(priority) || priority < 0 || priority > 100000) {
+      toast({ variant: "destructive", title: "优先级必须是 0 到 100000 的整数" })
+      return null
+    }
+    return { name, url, enabled: formData.enabled, priority }
+  }
+
+  const handleCreate = async () => {
+    const payload = buildPayload()
+    if (!payload) return
+    try {
+      await api.post("/admin/custom-sources", payload)
+      toast({
+        title: "创建成功",
+        description: payload.enabled ? "数据源已创建，正在后台同步" : "数据源已创建",
+      })
+      closeDialog()
+      loadSources()
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "创建失败",
+        description: errorText(error, "创建数据源失败"),
+      })
+    }
+  }
+
+  const handleUpdate = async () => {
+    if (!editingSource) return
+    const payload = buildPayload()
+    if (!payload) return
+    try {
+      await api.put(`/admin/custom-sources/${editingSource.id}`, payload)
+      toast({ title: "更新成功", description: "数据源已更新" })
+      closeDialog()
+      loadSources()
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "更新失败",
+        description: errorText(error, "更新数据源失败"),
+      })
+    }
+  }
+
+  const handleToggle = async (source: CustomSource, enabled: boolean) => {
+    try {
+      await api.put(`/admin/custom-sources/${source.id}`, {
+        name: source.name,
+        url: source.url,
+        enabled: enabled ? 1 : 0,
+        priority: source.priority,
+      })
+      loadSources(true)
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "操作失败",
+        description: errorText(error, "更新数据源失败"),
+      })
+    }
+  }
+
+  const handleDelete = async (source: CustomSource) => {
+    if (
+      !confirm(
+        `确定要删除数据源「${source.name}」吗?\n\n它写入的节目会一并清除；被它覆盖掉的内置节目要等下一次同步才会补回来。自动创建的频道会保留。`
+      )
+    )
+      return
+
+    try {
+      await api.delete(`/admin/custom-sources/${source.id}`)
+      toast({ title: "删除成功", description: "数据源已被删除" })
+      loadSources()
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "删除失败",
+        description:
+          error.response?.status === 409
+            ? "有数据源正在同步，请稍后再删除"
+            : errorText(error, "删除数据源失败"),
+      })
+    }
+  }
+
+  const handleSync = async (source: CustomSource) => {
+    try {
+      await api.post(`/admin/custom-sources/${source.id}/sync`)
+      toast({ title: "已开始同步", description: `正在后台同步「${source.name}」` })
+      loadSources(true)
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "同步失败",
+        description:
+          error.response?.status === 409
+            ? "有数据源正在同步，请稍后再试"
+            : errorText(error, "启动同步失败"),
+      })
+    }
+  }
+
+  const formatTime = (value: string | null) =>
+    value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "-"
+
+  return (
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <div>
+          <h1 className="text-3xl font-bold">数据源</h1>
+          <p className="text-gray-500 mt-1">
+            添加自己的 XMLTV 节目单文件（支持 .xml 和 .xml.gz），优先于内置数据源；
+            多个数据源重叠时优先级数字小的优先
+          </p>
+        </div>
+        <Button onClick={() => setIsCreateOpen(true)}>
+          <Plus className="h-4 w-4 mr-2" />
+          新建数据源
+        </Button>
+      </div>
+
+      {loading ? (
+        <div className="text-center py-12">加载中...</div>
+      ) : (
+        <div className="bg-white rounded-lg shadow">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>名称</TableHead>
+                <TableHead>地址</TableHead>
+                <TableHead>优先级</TableHead>
+                <TableHead>启用</TableHead>
+                <TableHead>同步状态</TableHead>
+                <TableHead>上次同步</TableHead>
+                <TableHead>节目数</TableHead>
+                <TableHead className="text-right">操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sources.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={8} className="text-center text-gray-500 py-8">
+                    还没有数据源，点击右上角「新建数据源」添加
+                  </TableCell>
+                </TableRow>
+              )}
+              {sources.map((source) => {
+                const status = statusStyles[source.last_status]
+                return (
+                  <TableRow key={source.id}>
+                    <TableCell className="font-medium">{source.name}</TableCell>
+                    <TableCell
+                      className="font-mono text-sm max-w-xs truncate"
+                      title={source.url}
+                    >
+                      {source.url}
+                    </TableCell>
+                    <TableCell>{source.priority}</TableCell>
+                    <TableCell>
+                      <Switch
+                        checked={source.enabled === 1}
+                        onCheckedChange={(checked) => handleToggle(source, checked)}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      {status ? (
+                        <span className={`px-2 py-1 rounded text-xs ${status.className}`}>
+                          {status.label}
+                        </span>
+                      ) : (
+                        <span className="text-gray-400 text-sm">未同步</span>
+                      )}
+                      {source.last_status === "failed" && source.last_error && (
+                        <div
+                          className="text-xs text-red-600 mt-1 max-w-xs truncate"
+                          title={source.last_error}
+                        >
+                          {source.last_error}
+                        </div>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-sm">{formatTime(source.last_sync_at)}</TableCell>
+                    <TableCell>{source.program_count}</TableCell>
+                    <TableCell className="text-right whitespace-nowrap">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="立即同步"
+                        disabled={source.last_status === "running"}
+                        onClick={() => handleSync(source)}
+                      >
+                        <RefreshCw
+                          className={`h-4 w-4 ${
+                            source.last_status === "running" ? "animate-spin" : ""
+                          }`}
+                        />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="编辑"
+                        onClick={() => openEdit(source)}
+                      >
+                        <Edit className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title="删除"
+                        onClick={() => handleDelete(source)}
+                      >
+                        <Trash2 className="h-4 w-4 text-red-500" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      <Dialog
+        open={isCreateOpen || !!editingSource}
+        onOpenChange={(open) => {
+          if (!open) closeDialog()
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{editingSource ? "编辑数据源" : "新建数据源"}</DialogTitle>
+            <DialogDescription>
+              文件里的所有频道都会导入，认不出的频道会自动新建；
+              和内置数据源重叠的时段以这里的文件为准
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="name">名称 *</Label>
+              <Input
+                id="name"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                placeholder="例如: 广东电信 IPTV"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="url">文件地址 *</Label>
+              <Input
+                id="url"
+                value={formData.url}
+                onChange={(e) => setFormData({ ...formData, url: e.target.value })}
+                placeholder="http://192.168.1.2/epg.xml.gz"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="priority">优先级</Label>
+              <Input
+                id="priority"
+                type="number"
+                min={0}
+                max={100000}
+                value={formData.priority}
+                onChange={(e) => setFormData({ ...formData, priority: e.target.value })}
+              />
+              <p className="text-xs text-gray-500">
+                数字越小优先级越高；多个数据源覆盖同一频道的同一时段时，以优先级高的为准
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <Label htmlFor="enabled">启用</Label>
+              <Switch
+                id="enabled"
+                checked={formData.enabled === 1}
+                onCheckedChange={(checked) =>
+                  setFormData({ ...formData, enabled: checked ? 1 : 0 })
+                }
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={closeDialog}>
+              取消
+            </Button>
+            <Button onClick={editingSource ? handleUpdate : handleCreate}>
+              {editingSource ? "更新" : "创建"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}

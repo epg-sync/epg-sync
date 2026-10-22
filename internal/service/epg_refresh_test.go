@@ -231,3 +231,37 @@ func TestSyncSkipsExistingWithoutForce(t *testing.T) {
 	assertPrograms(t, env.today(t, "纬来体育"), "homeplus:hp-old")
 	assertPrograms(t, env.today(t, "山东卫视"), "vl:vl-x")
 }
+
+// 自定义源在所有 provider 之后执行并覆盖重叠时段；它下载失败时频道回退到 provider 的数据
+func TestSyncAllEPGAppliesCustomSourcesLast(t *testing.T) {
+	vl := newFakeProvider("vl", 1, map[string]fakeResult{"CCTV1": {titles: []string{"vl-a", "vl-b"}}})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, vl)
+
+	customRepo := postgres.NewCustomSourceRepository(env.db)
+	custom := NewCustomSourceService(customRepo, postgres.NewChannelRepository(env.db), env.programs, cache.NewMemoryCache())
+	env.scheduler.SetCustomSources(custom)
+
+	now := time.Now()
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	files := newFileServer(t)
+	files.set("/epg.xml", buildXMLTV(
+		[]tvChannel{{id: "1", names: []string{"CCTV-1高清"}}},
+		[]tvProg{{"1", "cust", day, day.Add(time.Hour)}}, // 与 vl-a (00:00-01:00) 重叠
+	))
+	src := &model.CustomSource{Name: "电信", URL: files.URL + "/epg.xml", Enabled: 1, Priority: 10}
+	if err := customRepo.Create(context.Background(), src); err != nil {
+		t.Fatal(err)
+	}
+
+	env.scheduler.SyncAllEPG(true)
+	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":cust", "vl:vl-b")
+
+	// 自定义源下载失败：不动数据，下一轮强制刷新后频道回到 provider 的完整数据
+	files.remove("/epg.xml")
+	env.scheduler.SyncAllEPG(true)
+	assertPrograms(t, env.today(t, "CCTV1"), "vl:vl-a", "vl:vl-b")
+	got, _ := customRepo.GetByID(context.Background(), src.ID)
+	if got.LastStatus != model.CustomSourceStatusFailed {
+		t.Errorf("status = %q, want failed", got.LastStatus)
+	}
+}

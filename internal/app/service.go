@@ -14,9 +14,11 @@ func (app *App) initializeServices() error {
 		ChannelMapping: service.NewChannelMappingService(app.repos.ChannelMappings, app.repos.Channel),
 		User:           service.NewUserService(app.repos.User, app.cfg.Server.JWTSecret, app.cfg.Server.JWTExpireHours),
 		Log:            service.NewLogService(app.repos.Log, app.logHub, app.cfg.Logger.RetentionDays),
+		CustomSource:   service.NewCustomSourceService(app.repos.CustomSource, app.repos.Channel, app.repos.Program, app.cache),
 	}
 
 	app.services.Scheduler = service.NewSchedulerService(app.services.EPG, app.services.Channel, app.services.ChannelMapping, app.providerChain, app.cache)
+	app.services.Scheduler.SetCustomSources(app.services.CustomSource)
 
 	return nil
 }

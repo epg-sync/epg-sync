@@ -222,6 +222,49 @@ func (r *programRepo) ReplaceChannelDay(ctx context.Context, channelID string, d
 	return nil
 }
 
+func (r *programRepo) ReplaceChannelRange(ctx context.Context, channelID string, from, to time.Time, providerID string, ownFrom time.Time, programs []*model.Program) error {
+	var deleted int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where(
+			"channel_id = ? AND ((start_time < ? AND end_time > ?) OR (provider_id = ? AND end_time > ?))",
+			channelID, to, from, providerID, ownFrom,
+		).Delete(&model.Program{})
+		if result.Error != nil {
+			return result.Error
+		}
+		deleted = result.RowsAffected
+		if len(programs) == 0 {
+			return nil
+		}
+		return tx.CreateInBatches(programs, 1000).Error
+	})
+	if err != nil {
+		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to replace programs in range")
+	}
+
+	logger.Debug("Replaced programs in range",
+		logger.String("channel_id", channelID),
+		logger.String("provider_id", providerID),
+		logger.Time("from", from),
+		logger.Time("to", to),
+		logger.Int64("deleted", deleted),
+		logger.Int("inserted", len(programs)),
+	)
+	return nil
+}
+
+func (r *programRepo) DeleteByProviderID(ctx context.Context, providerID string) (int64, error) {
+	result := r.db.WithContext(ctx).Where("provider_id = ?", providerID).Delete(&model.Program{})
+	if result.Error != nil {
+		logger.Error("Failed to delete programs by provider",
+			logger.Err(result.Error),
+			logger.String("provider_id", providerID),
+		)
+		return 0, errors.Wrap(result.Error, errors.ErrCodeDatabaseQuery, "failed to delete programs by provider")
+	}
+	return result.RowsAffected, nil
+}
+
 func (r *programRepo) Exists(ctx context.Context, channelID string, date time.Time) (bool, error) {
 	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
 	endOfDay := startOfDay.Add(24 * time.Hour)
