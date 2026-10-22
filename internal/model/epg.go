@@ -21,6 +21,11 @@ type Program struct {
 	Channel *Channel `json:"channel,omitempty" gorm:"foreignKey:ChannelID;references:ChannelID"`
 }
 
+// TimeRange 是左闭右开的时间段 [From, To)
+type TimeRange struct {
+	From, To time.Time
+}
+
 type XMLTVEPG struct {
 	XMLName    xml.Name        `xml:"tv"`
 	Channels   []*XMLTVChannel `xml:"channel"`

@@ -16,6 +16,12 @@ type Channel struct {
 	UpdatedAt   time.Time `json:"updated_at" gorm:"column:updated_at"`
 }
 
+// ChannelRegexpMatch 是频道正则匹配某个名字的结果，Matched 为名字中被正则匹配到的部分（从开头起）
+type ChannelRegexpMatch struct {
+	Channel `gorm:"embedded"`
+	Matched string `gorm:"column:matched"`
+}
+
 type ChannelMapping struct {
 	ID                  int64     `json:"id" gorm:"column:id;primaryKey;autoIncrement;not null"`
 	CanonicalID         string    `json:"canonical_id" gorm:"column:canonical_id"`

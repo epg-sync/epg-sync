@@ -31,15 +31,19 @@ var ErrSyncInProgress = errors.New(errors.ErrCodeAlreadyExists, "custom source s
 
 // CustomSourceService 管理用户配置的 XMLTV 文件源，并把文件里的节目导入数据库。
 //
-// 导入以「时间范围」为单位覆盖：文件覆盖到的时间段以文件为准（不论原来是哪个 provider 写的），
-// 文件没覆盖到的时间段保留原有节目。调度时它在所有 provider 之后执行，所以始终优先于内置源
+// 导入以「时间段」为单位覆盖：文件里节目连续覆盖到的时间段以文件为准（不论原来是哪个 provider 写的），
+// 文件没覆盖到的时间段（包括节目之间的空档）保留原有节目。
+// 调度时它在所有 provider 之后执行，所以始终优先于内置源。
+//
+// 多个源之间靠写入顺序体现优先级：优先级低的先写、高的后写。所以任何一次同步都必须按优先级
+// 跑完所有已启用的源，单独同步某一个源会让它盖掉优先级更高的源
 type CustomSourceService struct {
 	repo        repository.CustomSourceRepository
 	channelRepo repository.ChannelRepository
 	programRepo repository.ProgramRepository
 	cache       cache.Cache
 
-	mu sync.Mutex // 同一时间只允许一个同步任务，避免定时任务和手动触发同时写同一批频道
+	mu sync.Mutex // 同一时间只允许一个任务写库，避免定时任务、手动同步、停用、删除相互覆盖
 }
 
 func NewCustomSourceService(
@@ -76,7 +80,7 @@ func validateCustomSource(src *model.CustomSource) error {
 	return nil
 }
 
-// Create 保存新的数据源；已启用时在后台立即同步一次
+// Create 保存新的数据源；已启用时在后台按优先级同步一次全部已启用的源
 func (s *CustomSourceService) Create(ctx context.Context, src *model.CustomSource) (*model.CustomSource, error) {
 	if err := validateCustomSource(src); err != nil {
 		return nil, err
@@ -85,12 +89,14 @@ func (s *CustomSourceService) Create(ctx context.Context, src *model.CustomSourc
 		return nil, err
 	}
 	if src.Enabled == 1 {
-		s.startSyncQuietly(src.ID)
+		s.startAllQuietly()
 	}
 	return src, nil
 }
 
-// Update 更新 name / url / enabled / priority；新启用或改了地址时在后台立即同步一次
+// Update 更新 name / url / enabled / priority。
+// 停用时清除它写入的节目，再重新同步其余的源，让被它覆盖掉的低优先级源的数据回来；
+// 新启用或改了地址时在后台重新同步
 func (s *CustomSourceService) Update(ctx context.Context, src *model.CustomSource) (*model.CustomSource, error) {
 	if err := validateCustomSource(src); err != nil {
 		return nil, err
@@ -99,16 +105,34 @@ func (s *CustomSourceService) Update(ctx context.Context, src *model.CustomSourc
 	if err != nil {
 		return nil, err
 	}
+
+	if old.Enabled == 1 && src.Enabled != 1 {
+		if !s.mu.TryLock() {
+			return nil, ErrSyncInProgress
+		}
+		// 先清节目再改状态：清除失败时源仍是启用状态，可以重试
+		err := s.purgeLocked(ctx, old)
+		if err == nil {
+			err = s.repo.Update(ctx, src)
+		}
+		s.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		s.startAllQuietly()
+		return s.repo.GetByID(ctx, src.ID)
+	}
+
 	if err := s.repo.Update(ctx, src); err != nil {
 		return nil, err
 	}
 	if src.Enabled == 1 && (old.Enabled != 1 || old.URL != src.URL) {
-		s.startSyncQuietly(src.ID)
+		s.startAllQuietly()
 	}
 	return s.repo.GetByID(ctx, src.ID)
 }
 
-// Delete 删除数据源并清理它写入的节目（被覆盖掉的内置节目要等下一次同步才会补回来）。
+// Delete 删除数据源并清理它写入的节目，然后重新同步其余的源（被覆盖掉的内置节目要等下一次全量同步才会补回来）。
 // 自动创建的频道保留，可以在频道管理页手动删除
 func (s *CustomSourceService) Delete(ctx context.Context, id int64) error {
 	src, err := s.repo.GetByID(ctx, id)
@@ -119,53 +143,84 @@ func (s *CustomSourceService) Delete(ctx context.Context, id int64) error {
 	if !s.mu.TryLock() {
 		return ErrSyncInProgress
 	}
-	defer s.mu.Unlock()
-
 	deleted, err := s.programRepo.DeleteByProviderID(ctx, src.ProviderID())
+	if err == nil {
+		err = s.repo.Delete(ctx, id)
+	}
+	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if err := s.repo.Delete(ctx, id); err != nil {
-		return err
-	}
+
 	s.invalidateXMLTVCache(ctx)
 	logger.Info("Deleted custom source",
 		logger.Int64("id", id),
 		logger.String("name", src.Name),
 		logger.Int64("programs_deleted", deleted),
 	)
+	s.startAllQuietly()
 	return nil
 }
 
-// StartSync 在后台同步一个数据源（不论是否启用），立即返回。已有同步在进行时返回 ErrSyncInProgress
+// purgeLocked 清除一个源写入的全部节目和同步状态。调用方负责持有 s.mu
+func (s *CustomSourceService) purgeLocked(ctx context.Context, src *model.CustomSource) error {
+	deleted, err := s.programRepo.DeleteByProviderID(ctx, src.ProviderID())
+	if err != nil {
+		return err
+	}
+	if err := s.repo.ClearSyncResult(ctx, src.ID); err != nil {
+		return err
+	}
+	s.invalidateXMLTVCache(ctx)
+	logger.Info("Purged programs of disabled custom source",
+		logger.Int64("id", src.ID),
+		logger.String("name", src.Name),
+		logger.Int64("programs_deleted", deleted),
+	)
+	return nil
+}
+
+// StartSync 是「立即同步」按钮：在后台按优先级同步全部已启用的源并立即返回。
+// 不能只同步 id 这一个，否则它会盖掉优先级更高的源。id 对应的源必须是启用状态；
+// 已有同步在进行时返回 ErrSyncInProgress
 func (s *CustomSourceService) StartSync(ctx context.Context, id int64) error {
 	src, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		return err
 	}
+	if src.Enabled != 1 {
+		return errors.InvalidParam("enabled", "数据源已停用，启用后才能同步")
+	}
+	return s.startAll(ctx)
+}
+
+// startAll 在后台按优先级同步全部已启用的源。返回前已把它们标记为 running
+func (s *CustomSourceService) startAll(ctx context.Context) error {
 	if !s.mu.TryLock() {
 		return ErrSyncInProgress
 	}
-	if err := s.repo.SetRunning(ctx, id); err != nil {
+	sources, err := s.enabledSources(ctx)
+	if err != nil || len(sources) == 0 {
 		s.mu.Unlock()
 		return err
 	}
+	s.markRunning(ctx, sources)
 	go func() {
 		defer s.mu.Unlock()
-		s.syncOne(context.Background(), src)
+		s.runLocked(context.Background(), sources)
 	}()
 	return nil
 }
 
-func (s *CustomSourceService) startSyncQuietly(id int64) {
-	if err := s.StartSync(context.Background(), id); err != nil {
-		logger.Warn("Skipped immediate custom source sync, use the sync button later",
-			logger.Int64("id", id), logger.Err(err))
+func (s *CustomSourceService) startAllQuietly() {
+	if err := s.startAll(context.Background()); err != nil {
+		logger.Warn("Skipped immediate custom source sync, it will run with the next scheduled sync",
+			logger.Err(err))
 	}
 }
 
-// SyncAll 依次同步所有已启用的数据源。优先级数字大的先写、数字小的后写，让优先级高的最终覆盖；
-// 已有同步在进行时直接跳过。单个源失败只记在它自己的状态上，不影响其它源
+// SyncAll 按优先级同步所有已启用的数据源，供定时任务调用；已有同步在进行时直接跳过。
+// 单个源失败只记在它自己的状态上，不影响其它源
 func (s *CustomSourceService) SyncAll(ctx context.Context) {
 	if !s.mu.TryLock() {
 		logger.Warn("Custom source sync already in progress, skipping")
@@ -173,23 +228,43 @@ func (s *CustomSourceService) SyncAll(ctx context.Context) {
 	}
 	defer s.mu.Unlock()
 
-	sources, err := s.repo.List(ctx)
+	sources, err := s.enabledSources(ctx)
 	if err != nil {
 		logger.Error("Failed to list custom sources", logger.Err(err))
 		return
 	}
+	s.markRunning(ctx, sources)
+	s.runLocked(ctx, sources)
+}
 
-	// List 按 priority、id 升序，倒着处理
-	for i := len(sources) - 1; i >= 0; i-- {
-		src := sources[i]
-		if src.Enabled != 1 {
-			continue
+// enabledSources 返回已启用的源，按 priority、id 升序
+func (s *CustomSourceService) enabledSources(ctx context.Context) ([]*model.CustomSource, error) {
+	all, err := s.repo.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	enabled := make([]*model.CustomSource, 0, len(all))
+	for _, src := range all {
+		if src.Enabled == 1 {
+			enabled = append(enabled, src)
 		}
+	}
+	return enabled, nil
+}
+
+func (s *CustomSourceService) markRunning(ctx context.Context, sources []*model.CustomSource) {
+	for _, src := range sources {
 		if err := s.repo.SetRunning(ctx, src.ID); err != nil {
 			logger.Error("Failed to mark custom source running", logger.Err(err), logger.Int64("id", src.ID))
-			continue
 		}
-		s.syncOne(ctx, src)
+	}
+}
+
+// runLocked 倒序处理按 priority 升序排好的源：数字大的先写、数字小的后写，让优先级高的最终覆盖。
+// 调用方负责持有 s.mu
+func (s *CustomSourceService) runLocked(ctx context.Context, sources []*model.CustomSource) {
+	for i := len(sources) - 1; i >= 0; i-- {
+		s.syncOne(ctx, sources[i])
 	}
 }
 
@@ -281,19 +356,24 @@ func (s *CustomSourceService) importSource(ctx context.Context, src *model.Custo
 	var failed []string
 	for _, id := range ids {
 		programs := buildPrograms(src, channels[id], grouped[id])
-		from, to := programs[0].StartTime, programs[0].EndTime
-		for _, p := range programs {
-			if p.EndTime.After(to) {
-				to = p.EndTime
-			}
-		}
-		if err := s.programRepo.ReplaceChannelRange(ctx, id, from, to, src.ProviderID(), win.From, programs); err != nil {
+		if err := s.programRepo.ReplaceChannelRanges(ctx, id, coveredRanges(programs), src.ProviderID(), win.From, programs); err != nil {
 			logger.Error("Failed to write custom source programs",
 				logger.Err(err), logger.Int64("source_id", src.ID), logger.String("channel_id", id))
 			failed = append(failed, id)
 			continue
 		}
 		total += len(programs)
+	}
+
+	// 文件里已经没有的频道（或改了正则后对应到别的频道），上次写入的节目要清掉。
+	// 写入失败的频道也在 ids 里，保留它们上次的数据
+	stale, err := s.programRepo.DeleteByProviderOutsideChannels(ctx, src.ProviderID(), ids, win.From)
+	if err != nil {
+		return total, err
+	}
+	if stale > 0 {
+		logger.Info("Removed programs of channels no longer in custom source",
+			logger.Int64("source_id", src.ID), logger.Int64("deleted", stale))
 	}
 
 	if len(failed) > 0 {
@@ -335,19 +415,44 @@ func buildPrograms(src *model.CustomSource, ch *model.Channel, in []*xmltv.Progr
 	return out
 }
 
-// 去掉频道名末尾的清晰度标记（含前面的空格、横线）。不含 4K：4K 频道通常是独立的节目单
+// coveredRanges 把按开始时间排好序的节目合并成连续的时间段：首尾相接或重叠的并成一段，
+// 中间有空档的分成两段。只有这些时间段里的原有节目会被覆盖，空档里的保留
+func coveredRanges(programs []*model.Program) []model.TimeRange {
+	var ranges []model.TimeRange
+	for _, p := range programs {
+		if n := len(ranges); n > 0 && !p.StartTime.After(ranges[n-1].To) {
+			if p.EndTime.After(ranges[n-1].To) {
+				ranges[n-1].To = p.EndTime
+			}
+			continue
+		}
+		ranges = append(ranges, model.TimeRange{From: p.StartTime, To: p.EndTime})
+	}
+	return ranges
+}
+
+// 名字末尾的清晰度标记（含前面的空格、横线）。不含 4K：4K 频道通常是独立的节目单
 var qualitySuffix = regexp.MustCompile(`(?i)[\s_\-]*(超高清|高清|标清|uhd|hd|sd)$`)
 
-// normalizeChannelName 去掉首尾空白和末尾的清晰度标记，如 "CCTV-1 高清" -> "CCTV-1"
-func normalizeChannelName(name string) string {
+// stripQuality 反复去掉末尾的清晰度标记，可能返回空串
+func stripQuality(name string) string {
 	name = strings.TrimSpace(name)
 	for {
 		trimmed := strings.TrimSpace(qualitySuffix.ReplaceAllString(name, ""))
-		if trimmed == "" || trimmed == name {
+		if trimmed == name {
 			return name
 		}
 		name = trimmed
 	}
+}
+
+// normalizeChannelName 去掉首尾空白和末尾的清晰度标记，如 "CCTV-1 高清" -> "CCTV-1"；
+// 名字全是清晰度标记时原样返回
+func normalizeChannelName(name string) string {
+	if n := stripQuality(name); n != "" {
+		return n
+	}
+	return strings.TrimSpace(name)
 }
 
 // nameRegexp 生成新频道的匹配正则，让 /api/diyp 这类按名称查询的接口能找到它（含清晰度后缀的写法）
@@ -355,13 +460,31 @@ func nameRegexp(name string) string {
 	return `^` + regexp.QuoteMeta(name) + `(\s*(超高清|高清|超清|标清|hd|uhd|sd))?$`
 }
 
+const nameSeparators = " \t-_·|"
+
+// regexpRemainderOK 判断正则匹配后剩下的部分是否仍指同一个频道。
+//
+// 种子频道的正则大多只锚定开头（如 ^广东卫视），会把「广东卫视国际」也匹配进来。
+// 剩下的部分为空、只是清晰度标记或「频道」，或者是频道名称里本来就有的文字（如 CCTV-5+ 后面的「体育赛事」），
+// 才认为是同一个频道
+func regexpRemainderOK(remainder string, ch *model.Channel) bool {
+	rest := strings.Trim(remainder, nameSeparators)
+	rest = strings.Trim(stripQuality(rest), nameSeparators)
+	rest = strings.Trim(strings.TrimSuffix(rest, "频道"), nameSeparators)
+	if rest == "" {
+		return true
+	}
+	rest = strings.ToLower(rest)
+	return strings.Contains(strings.ToLower(ch.DisplayName), rest) ||
+		strings.Contains(strings.ToLower(ch.ChannelID), rest)
+}
+
 // channelResolver 把文件里的频道对应到数据库里的频道，对应不上就新建
 type channelResolver struct {
-	repo   repository.ChannelRepository
-	byID   map[string]*model.Channel // 小写 channel_id
-	byName map[string]*model.Channel // 小写 display_name
-	misses map[string]bool           // 正则匹配不到的名字，避免重复查库
-	hits   map[string]*model.Channel // 正则匹配到的名字
+	repo    repository.ChannelRepository
+	byID    map[string]*model.Channel // 小写 channel_id
+	byName  map[string]*model.Channel // 小写 display_name
+	regexps map[string]*model.Channel // 正则匹配结果（含匹配不到的 nil），避免重复查库
 }
 
 func newChannelResolver(ctx context.Context, repo repository.ChannelRepository) (*channelResolver, error) {
@@ -370,11 +493,10 @@ func newChannelResolver(ctx context.Context, repo repository.ChannelRepository) 
 		return nil, err
 	}
 	r := &channelResolver{
-		repo:   repo,
-		byID:   make(map[string]*model.Channel, len(all)),
-		byName: make(map[string]*model.Channel, len(all)),
-		misses: make(map[string]bool),
-		hits:   make(map[string]*model.Channel),
+		repo:    repo,
+		byID:    make(map[string]*model.Channel, len(all)),
+		byName:  make(map[string]*model.Channel, len(all)),
+		regexps: make(map[string]*model.Channel),
 	}
 	for _, ch := range all {
 		r.index(ch)
@@ -391,7 +513,8 @@ func (r *channelResolver) index(ch *model.Channel) {
 	}
 }
 
-// resolve 依次按 channel_id 精确匹配、名称正则、display_name 精确匹配查找，都没有就新建。
+// resolve 依次按 channel_id 精确匹配、display_name 精确匹配、名称正则查找，都没有就新建。
+// 精确匹配排在正则前面，避免宽松的前缀正则抢先匹配到别的频道。
 // 已存在的频道（内置的、用户手动改过的）不会被修改
 func (r *channelResolver) resolve(ctx context.Context, info *xmltv.Channel) (*model.Channel, error) {
 	names := info.DisplayNames
@@ -415,20 +538,20 @@ func (r *channelResolver) resolve(ctx context.Context, info *xmltv.Channel) (*mo
 		}
 	}
 
-	// 2. 名称正则。种子频道的正则用了 Postgres 才支持的前瞻语法，只能让数据库来匹配
+	// 2. display_name 精确匹配
+	for _, c := range candidates {
+		if ch := r.byName[strings.ToLower(c)]; ch != nil {
+			return ch, nil
+		}
+	}
+
+	// 3. 名称正则。种子频道的正则用了 Postgres 才支持的前瞻语法，只能让数据库来匹配
 	for _, c := range candidates {
 		ch, err := r.matchByRegexp(ctx, c)
 		if err != nil {
 			return nil, err
 		}
 		if ch != nil {
-			return ch, nil
-		}
-	}
-
-	// 3. display_name 精确匹配
-	for _, c := range candidates {
-		if ch := r.byName[strings.ToLower(c)]; ch != nil {
 			return ch, nil
 		}
 	}
@@ -456,21 +579,22 @@ func (r *channelResolver) resolve(ctx context.Context, info *xmltv.Channel) (*mo
 	return ch, nil
 }
 
+// matchByRegexp 返回正则能匹配 name、且剩下的部分仍指同一频道的第一个频道（按 id），没有则返回 nil
 func (r *channelResolver) matchByRegexp(ctx context.Context, name string) (*model.Channel, error) {
-	if ch, ok := r.hits[name]; ok {
+	if ch, ok := r.regexps[name]; ok {
 		return ch, nil
 	}
-	if r.misses[name] {
-		return nil, nil
-	}
-	ch, err := r.repo.GetByChannelName(ctx, name)
+	matches, err := r.repo.MatchByRegexp(ctx, name)
 	if err != nil {
-		if errors.Is(err, errors.ErrCodeChannelNotFound) {
-			r.misses[name] = true
-			return nil, nil
-		}
 		return nil, err
 	}
-	r.hits[name] = ch
-	return ch, nil
+	var found *model.Channel
+	for _, m := range matches {
+		if regexpRemainderOK(strings.Replace(name, m.Matched, "", 1), &m.Channel) {
+			found = &m.Channel
+			break
+		}
+	}
+	r.regexps[name] = found
+	return found, nil
 }

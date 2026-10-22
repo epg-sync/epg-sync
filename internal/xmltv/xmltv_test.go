@@ -5,12 +5,16 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 const sampleXML = `<?xml version="1.0" encoding="UTF-8"?>
@@ -81,6 +85,35 @@ func TestParseTimeKeepsOffset(t *testing.T) {
 	}
 	if want := time.Date(2025, 10, 22, 11, 0, 0, 0, time.UTC); !got.Equal(want) {
 		t.Errorf("got %v, want %v", got.UTC(), want)
+	}
+}
+
+// 国内 IPTV 导出的文件常用 GB2312 / GBK / GB18030 编码
+func TestParseChineseEncodings(t *testing.T) {
+	doc := `<?xml version="1.0" encoding="%s"?><tv>
+  <channel id="1"><display-name>广东卫视</display-name></channel>
+  <programme start="20251022060000 +0800" stop="20251022070000 +0800" channel="1"><title>珠江新闻</title></programme>
+</tv>`
+	encoders := map[string]*encoding.Encoder{
+		"GB2312":  simplifiedchinese.GBK.NewEncoder(),
+		"GBK":     simplifiedchinese.GBK.NewEncoder(),
+		"gb18030": simplifiedchinese.GB18030.NewEncoder(),
+	}
+	win := Window{From: cst(0, 0), To: cst(0, 0).AddDate(0, 0, 1)}
+	for label, enc := range encoders {
+		raw, err := enc.String(fmt.Sprintf(doc, label))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := Parse(strings.NewReader(raw), win)
+		if err != nil {
+			t.Errorf("%s: %v", label, err)
+			continue
+		}
+		if len(res.Channels) != 1 || res.Channels[0].DisplayNames[0] != "广东卫视" ||
+			len(res.Programmes) != 1 || res.Programmes[0].Title != "珠江新闻" {
+			t.Errorf("%s: decoded wrong: channels=%+v programmes=%+v", label, res.Channels, res.Programmes)
+		}
 	}
 }
 

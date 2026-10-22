@@ -6,6 +6,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html/charset"
 )
 
 // DefaultLocation 是时间字符串不带时区偏移时采用的时区（东八区）。
@@ -62,6 +64,8 @@ func Parse(r io.Reader, win Window) (*Result, error) {
 	dec := xml.NewDecoder(r)
 	// 抓来的文件常有未转义的 & 之类的小毛病，宽松模式下尽量继续解析
 	dec.Strict = false
+	// 国内 IPTV 导出的文件常声明 encoding="GB2312" / "GBK"，标准库只认 UTF-8
+	dec.CharsetReader = charset.NewReaderLabel
 
 	res := &Result{}
 	for {

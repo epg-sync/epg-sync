@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -537,5 +538,271 @@ func TestNormalizeChannelName(t *testing.T) {
 		if got := normalizeChannelName(in); got != want {
 			t.Errorf("normalizeChannelName(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// 问题 2：同一频道的节目中间有空档时，空档里的内置节目必须保留
+func TestCustomSourceKeepsBuiltinInGaps(t *testing.T) {
+	e := newCustomEnv(t)
+	e.seedBuiltin(t, "CCTV1")
+	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
+		[]tvProg{{"1", "c8", e.h(8), e.h(9)}, {"1", "c9", e.h(9), e.h(10)}, {"1", "c20", e.h(20), e.h(21)}}))
+	src := e.addSource(t, "/a.xml", 10, 1)
+	pid := src.ProviderID()
+
+	e.svc.SyncAll(context.Background())
+
+	var want []string
+	for i := range 24 {
+		switch i {
+		case 8:
+			want = append(want, pid+":c8")
+		case 9:
+			want = append(want, pid+":c9")
+		case 20:
+			want = append(want, pid+":c20")
+		default:
+			want = append(want, fmt.Sprintf("cctv_cn:b%d", i))
+		}
+	}
+	assertPrograms(t, e.listed(t, "CCTV1"), want...)
+}
+
+// 问题 3：「立即同步」优先级低的源，不能盖掉优先级高的源
+func TestCustomSourceManualSyncKeepsPriority(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
+	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))
+	high := e.addSource(t, "/high.xml", 1, 1)
+	low := e.addSource(t, "/low.xml", 5, 1)
+
+	if err := e.svc.StartSync(ctx, low.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 两个源都被标记为同步中，并且都同步完成
+	if got := e.source(t, high.ID); got.LastStatus != model.CustomSourceStatusRunning &&
+		got.LastStatus != model.CustomSourceStatusSuccess {
+		t.Errorf("high status = %q, want running or success", got.LastStatus)
+	}
+	waitStatus(t, e, low.ID, model.CustomSourceStatusSuccess)
+	waitStatus(t, e, high.ID, model.CustomSourceStatusSuccess)
+	assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
+}
+
+func TestCustomSourceStartSyncRejectsDisabled(t *testing.T) {
+	e := newCustomEnv(t)
+	src := e.addSource(t, "/a.xml", 10, 0)
+	if err := e.svc.StartSync(context.Background(), src.ID); !errors.Is(err, errors.ErrCodeInvalidParam) {
+		t.Errorf("StartSync on disabled source err = %v, want invalid param", err)
+	}
+}
+
+// waitPrograms 等频道的节目变成 want（后台同步是异步的）
+func waitPrograms(t *testing.T, e *customEnv, channelID string, want ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := e.listed(t, channelID)
+		if strings.Join(got, ",") == strings.Join(want, ",") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %q, want %q", channelID, got, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// 问题 4：停用后清除它写入的节目，被它覆盖的低优先级源的数据重新同步回来
+func TestCustomSourceDisablePurgesAndRestoresLower(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
+	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))
+	high := e.addSource(t, "/high.xml", 1, 1)
+	low := e.addSource(t, "/low.xml", 5, 1)
+	e.svc.SyncAll(ctx)
+	assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
+
+	high.Enabled = 0
+	updated, err := e.svc.Update(ctx, high)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Enabled != 0 || updated.LastStatus != "" || updated.ProgramCount != 0 {
+		t.Errorf("disabled source state = %+v, want enabled=0, status empty, program_count 0", updated)
+	}
+	waitPrograms(t, e, "本地台", low.ProviderID()+":L")
+	waitStatus(t, e, low.ID, model.CustomSourceStatusSuccess)
+
+	// 之后的定时同步也不会再写入停用的源
+	e.svc.SyncAll(ctx)
+	assertPrograms(t, e.listed(t, "本地台"), low.ProviderID()+":L")
+}
+
+// 只有一个源时停用：节目被清除，频道恢复成内置数据（被删的时段要等内置源下次同步补回）
+func TestCustomSourceDisableOnlySource(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	e.seedBuiltin(t, "CCTV1")
+	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
+		[]tvProg{{"1", "c8", e.h(8), e.h(9)}}))
+	src := e.addSource(t, "/a.xml", 10, 1)
+	e.svc.SyncAll(ctx)
+
+	src.Enabled = 0
+	if _, err := e.svc.Update(ctx, src); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range e.listed(t, "CCTV1") {
+		if strings.HasPrefix(p, model.CustomSourceProviderPrefix) {
+			t.Fatalf("disabled source still has %s", p)
+		}
+	}
+	if got := len(e.listed(t, "CCTV1")); got != 23 {
+		t.Errorf("CCTV1 has %d programs, want 23", got)
+	}
+}
+
+func TestCustomSourceDisableDuringSyncConflicts(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"本地台"}}},
+		[]tvProg{{"1", "a", e.h(8), e.h(9)}}))
+	e.files.gate = make(chan struct{})
+	src := e.addSource(t, "/a.xml", 10, 1)
+	if err := e.svc.StartSync(ctx, src.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	src.Enabled = 0
+	if _, err := e.svc.Update(ctx, src); !errors.Is(err, errors.ErrCodeAlreadyExists) {
+		t.Errorf("disable during sync err = %v, want ErrSyncInProgress", err)
+	}
+	if got := e.source(t, src.ID); got.Enabled != 1 {
+		t.Errorf("source was disabled despite the conflict")
+	}
+	close(e.files.gate)
+	waitStatus(t, e, src.ID, model.CustomSourceStatusSuccess)
+}
+
+// 问题 5：文件里去掉的频道，上次写入的节目要清掉；其它源的节目不受影响
+func TestCustomSourceRemovedChannelIsCleaned(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	e.files.set("/a.xml", buildXMLTV(
+		[]tvChannel{{id: "1", names: []string{"台A"}}, {id: "2", names: []string{"台B"}}},
+		[]tvProg{{"1", "a", e.h(8), e.h(9)}, {"2", "b", e.h(8), e.h(9)}}))
+	e.files.set("/other.xml", buildXMLTV(
+		[]tvChannel{{id: "x", names: []string{"台B"}}},
+		[]tvProg{{"x", "other", e.h(12), e.h(13)}}))
+	src := e.addSource(t, "/a.xml", 10, 1)
+	other := e.addSource(t, "/other.xml", 20, 1)
+	e.svc.SyncAll(ctx)
+	assertPrograms(t, e.listed(t, "台B"), src.ProviderID()+":b", other.ProviderID()+":other")
+
+	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"台A"}}},
+		[]tvProg{{"1", "a", e.h(8), e.h(9)}}))
+	e.svc.SyncAll(ctx)
+
+	assertPrograms(t, e.listed(t, "台A"), src.ProviderID()+":a")
+	assertPrograms(t, e.listed(t, "台B"), other.ProviderID()+":other")
+}
+
+// 问题 6：宽松的前缀正则不能把不同的频道合并进来，但真正同一频道的各种写法仍要认出来
+func TestCustomSourceChannelMatching(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		want string // 期望对应到的 channel_id
+	}{
+		{"广东卫视国际", "广东卫视国际"}, // ^广东卫视 前缀匹配，但「国际」是另一个频道 -> 新建
+		{"北京卫视4K", "北京卫视4K"}, // 4K 是独立频道 -> 新建
+		{"广东卫视高清", "广东卫视"},
+		{"CCTV-5+ 体育赛事", "CCTV5+"}, // 剩下的「体育赛事」是频道名本来就有的
+		{"CCTV1 综合频道", "CCTV1"},
+		{"CCTV-1 综合", "CCTV1"}, // display_name 精确匹配
+		{"cctv13", "CCTV13"},
+	}
+	var channels []tvChannel
+	var progs []tvProg
+	for i, c := range cases {
+		id := fmt.Sprintf("c%d", i)
+		channels = append(channels, tvChannel{id: id, names: []string{c.name}})
+		// 每个用例一个时段，几个名字归到同一频道时不会被当成重复节目去掉
+		progs = append(progs, tvProg{id, c.name, e.h(i), e.h(i + 1)})
+	}
+	e.files.set("/a.xml", buildXMLTV(channels, progs))
+	src := e.addSource(t, "/a.xml", 10, 1)
+	e.svc.SyncAll(ctx)
+
+	if got := e.source(t, src.ID); got.LastStatus != model.CustomSourceStatusSuccess {
+		t.Fatalf("sync failed: %s", got.LastError)
+	}
+	for _, c := range cases {
+		got := e.listed(t, c.want)
+		if !slices.Contains(got, src.ProviderID()+":"+c.name) {
+			t.Errorf("%q: channel %s has %q, want it to hold this programme", c.name, c.want, got)
+		}
+	}
+	// 被前缀正则误匹配的内置频道不能收到别的频道的节目
+	for _, id := range []string{"广东卫视", "北京卫视"} {
+		for _, p := range e.listed(t, id) {
+			if strings.Contains(p, "国际") || strings.Contains(p, "4K") {
+				t.Errorf("%s got programme of another channel: %s", id, p)
+			}
+		}
+	}
+}
+
+func TestRegexpRemainderOK(t *testing.T) {
+	cctv5p := &model.Channel{ChannelID: "CCTV5+", DisplayName: "CCTV-5 体育赛事"}
+	gd := &model.Channel{ChannelID: "广东卫视", DisplayName: "广东卫视"}
+	cases := []struct {
+		rest string
+		ch   *model.Channel
+		want bool
+	}{
+		{"", gd, true},
+		{"高清", gd, true},
+		{" HD", gd, true},
+		{"-超高清", gd, true},
+		{" 频道", gd, true},
+		{"频道 高清", gd, true},
+		{"国际", gd, false},
+		{"4K", gd, false},
+		{" 体育赛事", cctv5p, true},
+		{"体育赛事 HD", cctv5p, true},
+		{"足球", cctv5p, false},
+	}
+	for _, c := range cases {
+		if got := regexpRemainderOK(c.rest, c.ch); got != c.want {
+			t.Errorf("regexpRemainderOK(%q, %s) = %v, want %v", c.rest, c.ch.ChannelID, got, c.want)
+		}
+	}
+}
+
+func TestCoveredRanges(t *testing.T) {
+	base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	h := func(n int) time.Time { return base.Add(time.Duration(n) * time.Hour) }
+	p := func(from, to int) *model.Program { return &model.Program{StartTime: h(from), EndTime: h(to)} }
+
+	got := coveredRanges([]*model.Program{p(1, 2), p(2, 3), p(3, 5), p(4, 6), p(8, 9), p(9, 10), p(12, 13)})
+	want := []model.TimeRange{{From: h(1), To: h(6)}, {From: h(8), To: h(10)}, {From: h(12), To: h(13)}}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if !got[i].From.Equal(want[i].From) || !got[i].To.Equal(want[i].To) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+	if got := coveredRanges(nil); len(got) != 0 {
+		t.Errorf("empty input: %v", got)
 	}
 }

@@ -158,10 +158,17 @@ export default function CustomSourcesPage() {
     }
   }
 
+  const DISABLE_CONFIRM =
+    "停用后会清除这个数据源写入的全部节目，并重新同步其余数据源。\n被它覆盖掉的内置节目要等下一次全量同步才会补回来。确定停用吗?"
+
+  const conflictText = (error: any, fallback: string) =>
+    error.response?.status === 409 ? "有数据源正在同步，请稍后再试" : errorText(error, fallback)
+
   const handleUpdate = async () => {
     if (!editingSource) return
     const payload = buildPayload()
     if (!payload) return
+    if (editingSource.enabled === 1 && payload.enabled !== 1 && !confirm(DISABLE_CONFIRM)) return
     try {
       await api.put(`/admin/custom-sources/${editingSource.id}`, payload)
       toast({ title: "更新成功", description: "数据源已更新" })
@@ -171,12 +178,13 @@ export default function CustomSourcesPage() {
       toast({
         variant: "destructive",
         title: "更新失败",
-        description: errorText(error, "更新数据源失败"),
+        description: conflictText(error, "更新数据源失败"),
       })
     }
   }
 
   const handleToggle = async (source: CustomSource, enabled: boolean) => {
+    if (!enabled && !confirm(DISABLE_CONFIRM)) return
     try {
       await api.put(`/admin/custom-sources/${source.id}`, {
         name: source.name,
@@ -189,7 +197,7 @@ export default function CustomSourcesPage() {
       toast({
         variant: "destructive",
         title: "操作失败",
-        description: errorText(error, "更新数据源失败"),
+        description: conflictText(error, "更新数据源失败"),
       })
     }
   }
@@ -197,7 +205,7 @@ export default function CustomSourcesPage() {
   const handleDelete = async (source: CustomSource) => {
     if (
       !confirm(
-        `确定要删除数据源「${source.name}」吗?\n\n它写入的节目会一并清除；被它覆盖掉的内置节目要等下一次同步才会补回来。自动创建的频道会保留。`
+        `确定要删除数据源「${source.name}」吗?\n\n它写入的节目会一并清除，其余数据源会重新同步；被它覆盖掉的内置节目要等下一次全量同步才会补回来。自动创建的频道会保留。`
       )
     )
       return
@@ -210,10 +218,7 @@ export default function CustomSourcesPage() {
       toast({
         variant: "destructive",
         title: "删除失败",
-        description:
-          error.response?.status === 409
-            ? "有数据源正在同步，请稍后再删除"
-            : errorText(error, "删除数据源失败"),
+        description: conflictText(error, "删除数据源失败"),
       })
     }
   }
@@ -221,16 +226,16 @@ export default function CustomSourcesPage() {
   const handleSync = async (source: CustomSource) => {
     try {
       await api.post(`/admin/custom-sources/${source.id}/sync`)
-      toast({ title: "已开始同步", description: `正在后台同步「${source.name}」` })
+      toast({
+        title: "已开始同步",
+        description: "正在后台按优先级同步所有已启用的数据源",
+      })
       loadSources(true)
     } catch (error: any) {
       toast({
         variant: "destructive",
         title: "同步失败",
-        description:
-          error.response?.status === 409
-            ? "有数据源正在同步，请稍后再试"
-            : errorText(error, "启动同步失败"),
+        description: conflictText(error, "启动同步失败"),
       })
     }
   }
@@ -320,8 +325,12 @@ export default function CustomSourcesPage() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        title="立即同步"
-                        disabled={source.last_status === "running"}
+                        title={
+                          source.enabled === 1
+                            ? "立即同步（按优先级同步所有已启用的数据源）"
+                            : "已停用，启用后才能同步"
+                        }
+                        disabled={source.enabled !== 1 || source.last_status === "running"}
                         onClick={() => handleSync(source)}
                       >
                         <RefreshCw

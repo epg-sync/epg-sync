@@ -117,6 +117,17 @@ func (r *customSourceRepo) SetSyncResult(ctx context.Context, id int64, status, 
 	return nil
 }
 
+func (r *customSourceRepo) ClearSyncResult(ctx context.Context, id int64) error {
+	err := r.db.WithContext(ctx).
+		Model(&model.CustomSource{}).
+		Where("id = ?", id).
+		Updates(map[string]any{"last_status": "", "last_error": "", "program_count": 0}).Error
+	if err != nil {
+		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to clear custom source sync result")
+	}
+	return nil
+}
+
 // ResetRunning 把残留的 running 状态清掉。进程中途退出会让状态卡在 running，启动时调用
 func (r *customSourceRepo) ResetRunning(ctx context.Context) error {
 	err := r.db.WithContext(ctx).

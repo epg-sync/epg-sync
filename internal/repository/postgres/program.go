@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/epg-sync/epgsync/internal/model"
@@ -222,35 +223,69 @@ func (r *programRepo) ReplaceChannelDay(ctx context.Context, channelID string, d
 	return nil
 }
 
-func (r *programRepo) ReplaceChannelRange(ctx context.Context, channelID string, from, to time.Time, providerID string, ownFrom time.Time, programs []*model.Program) error {
+// 每条 DELETE 最多带的时间段数，避免超过 Postgres 单条语句 65535 个参数的上限
+const replaceRangesPerStatement = 1000
+
+func (r *programRepo) ReplaceChannelRanges(ctx context.Context, channelID string, ranges []model.TimeRange, providerID string, ownFrom time.Time, programs []*model.Program) error {
 	var deleted int64
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Where(
-			"channel_id = ? AND ((start_time < ? AND end_time > ?) OR (provider_id = ? AND end_time > ?))",
-			channelID, to, from, providerID, ownFrom,
-		).Delete(&model.Program{})
+		result := tx.Where("channel_id = ? AND provider_id = ? AND end_time > ?", channelID, providerID, ownFrom).
+			Delete(&model.Program{})
 		if result.Error != nil {
 			return result.Error
 		}
 		deleted = result.RowsAffected
+
+		for start := 0; start < len(ranges); start += replaceRangesPerStatement {
+			chunk := ranges[start:min(start+replaceRangesPerStatement, len(ranges))]
+			overlaps := make([]string, len(chunk))
+			args := make([]any, 0, 1+2*len(chunk))
+			args = append(args, channelID)
+			for i, rg := range chunk {
+				overlaps[i] = "(start_time < ? AND end_time > ?)"
+				args = append(args, rg.To, rg.From)
+			}
+			result := tx.Where("channel_id = ? AND ("+strings.Join(overlaps, " OR ")+")", args...).
+				Delete(&model.Program{})
+			if result.Error != nil {
+				return result.Error
+			}
+			deleted += result.RowsAffected
+		}
+
 		if len(programs) == 0 {
 			return nil
 		}
 		return tx.CreateInBatches(programs, 1000).Error
 	})
 	if err != nil {
-		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to replace programs in range")
+		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to replace programs in ranges")
 	}
 
-	logger.Debug("Replaced programs in range",
+	logger.Debug("Replaced programs in ranges",
 		logger.String("channel_id", channelID),
 		logger.String("provider_id", providerID),
-		logger.Time("from", from),
-		logger.Time("to", to),
+		logger.Int("ranges", len(ranges)),
 		logger.Int64("deleted", deleted),
 		logger.Int("inserted", len(programs)),
 	)
 	return nil
+}
+
+func (r *programRepo) DeleteByProviderOutsideChannels(ctx context.Context, providerID string, keep []string, after time.Time) (int64, error) {
+	query := r.db.WithContext(ctx).Where("provider_id = ? AND end_time > ?", providerID, after)
+	if len(keep) > 0 {
+		query = query.Where("channel_id NOT IN ?", keep)
+	}
+	result := query.Delete(&model.Program{})
+	if result.Error != nil {
+		logger.Error("Failed to delete stale programs by provider",
+			logger.Err(result.Error),
+			logger.String("provider_id", providerID),
+		)
+		return 0, errors.Wrap(result.Error, errors.ErrCodeDatabaseQuery, "failed to delete stale programs by provider")
+	}
+	return result.RowsAffected, nil
 }
 
 func (r *programRepo) DeleteByProviderID(ctx context.Context, providerID string) (int64, error) {
