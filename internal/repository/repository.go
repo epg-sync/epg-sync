@@ -32,6 +32,9 @@ type ProgramRepository interface {
 
 	Create(ctx context.Context, program *model.Program) error
 	CreateBatch(ctx context.Context, programs []*model.Program) error
+	// CreateBatchReplacingFill 写入内置源抓到的节目，并在同一个事务里删除增量源在这些频道上、
+	// 与新节目时间范围重叠的节目。增量源只补内置源没有的内容，内置源一旦有数据就换掉它们
+	CreateBatchReplacingFill(ctx context.Context, programs []*model.Program) error
 	ListByChannelAndDate(ctx context.Context, channel *model.Channel, date string) ([]*model.Program, error)
 	ListByChannelIDAndDate(ctx context.Context, channelID string, date time.Time, page, pageSize int) ([]*model.Program, int64, error)
 	ListByChannelIDAndTimeRange(ctx context.Context, channelID string, start, end time.Time) ([]*model.Program, error)
@@ -40,13 +43,16 @@ type ProgramRepository interface {
 	DeleteBefore(ctx context.Context, before time.Time) (int64, error)
 	// ReplaceChannelDay 在一个事务中删除频道在 date 当天开始的全部节目（不分 provider），再写入 programs
 	ReplaceChannelDay(ctx context.Context, channelID string, date time.Time, programs []*model.Program) error
-	// ReplaceChannelRanges 在一个事务中删除频道与 ranges 中任一时间段有重叠的全部节目（不分 provider），
-	// 以及 providerID 此前写入的、结束时间晚于 ownFrom 的节目（清理上次同步留下的旧数据），再写入 programs。
-	// 时间段之外（包括时间段之间的空档）其它 provider 的节目原样保留
-	ReplaceChannelRanges(ctx context.Context, channelID string, ranges []model.TimeRange, providerID string, ownFrom time.Time, programs []*model.Program) error
+	// ReplaceChannelDays 在一个事务中：删除 providerID 此前在该频道写入的、结束时间晚于 ownFrom 的节目
+	// （清理上次同步留下的旧数据）；删除开始时间落在 days 任一天内的全部节目（不分 provider）；再写入 programs。
+	// days 之外其它 provider 的节目原样保留。days 为空时只做清理
+	ReplaceChannelDays(ctx context.Context, channelID string, days []model.TimeRange, providerID string, ownFrom time.Time, programs []*model.Program) error
+	// ListProviderDays 列出频道在 [from, to) 内各 provider 有节目的日期，日期按 timezone 计算，按开始时间归属
+	ListProviderDays(ctx context.Context, channelID, timezone string, from, to time.Time) ([]*model.ProviderDay, error)
 	DeleteByProviderID(ctx context.Context, providerID string) (int64, error)
 	// DeleteByProviderOutsideChannels 删除 providerID 写入的、结束时间晚于 after、且频道不在 keep 中的节目
 	DeleteByProviderOutsideChannels(ctx context.Context, providerID string, keep []string, after time.Time) (int64, error)
+	// Exists 判断频道在 date 当天是否已有节目。增量源（custom-fill:）的节目不算，内置源会照常抓取并换掉它们
 	Exists(ctx context.Context, channelID string, date time.Time) (bool, error)
 }
 
@@ -56,11 +62,11 @@ type CustomSourceRepository interface {
 	Create(ctx context.Context, source *model.CustomSource) error
 	List(ctx context.Context) ([]*model.CustomSource, error)
 	GetByID(ctx context.Context, id int64) (*model.CustomSource, error)
-	// Update 只更新 name / url / enabled / priority
+	// Update 只更新 name / url / mode / enabled / priority
 	Update(ctx context.Context, source *model.CustomSource) error
 	Delete(ctx context.Context, id int64) error
 	SetRunning(ctx context.Context, id int64) error
-	SetSyncResult(ctx context.Context, id int64, status, lastError string, programCount int) error
+	SetSyncResult(ctx context.Context, id int64, status, lastError, message string, programCount int) error
 	// ClearSyncResult 清空同步状态和节目数（停用后节目已被清除），保留上次同步时间
 	ClearSyncResult(ctx context.Context, id int64) error
 	// ResetRunning 把进程中途退出留下的 running 状态改为 failed

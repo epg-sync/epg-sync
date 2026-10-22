@@ -19,6 +19,8 @@ func (app *App) initializeServices() error {
 
 	app.services.Scheduler = service.NewSchedulerService(app.services.EPG, app.services.Channel, app.services.ChannelMapping, app.providerChain, app.cache)
 	app.services.Scheduler.SetCustomSources(app.services.CustomSource)
+	// 全量源的数据被清除后，在后台补抓内置节目，同步结束时会顺带重新同步自定义源
+	app.services.CustomSource.SetRefill(func() { go app.services.Scheduler.SyncAllEPG(false) })
 
 	return nil
 }

@@ -16,11 +16,15 @@ export interface CustomSource {
   id: number;
   name: string;
   url: string;
+  // full 全量覆盖：按「频道+天」覆盖内置数据，先添加的优先；fill 增量补充：只补内置和全量源当天都没有的
+  mode: "full" | "fill";
   enabled: number;
+  // 只对增量源有意义，数字越小越优先
   priority: number;
   last_sync_at: string | null;
   last_status: "" | "running" | "success" | "failed";
   last_error: string;
+  last_message: string;
   program_count: number;
   created_at: string;
   updated_at: string;
