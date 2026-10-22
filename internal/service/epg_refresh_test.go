@@ -232,7 +232,7 @@ func TestSyncSkipsExistingWithoutForce(t *testing.T) {
 	assertPrograms(t, env.today(t, "山东卫视"), "vl:vl-x")
 }
 
-// 自定义源在所有 provider 之后执行并覆盖重叠时段；它下载失败时频道回退到 provider 的数据
+// 全量自定义源在所有 provider 之后执行，当天整天以它为准；它下载失败时频道回退到 provider 的数据
 func TestSyncAllEPGAppliesCustomSourcesLast(t *testing.T) {
 	vl := newFakeProvider("vl", 1, map[string]fakeResult{"CCTV1": {titles: []string{"vl-a", "vl-b"}}})
 	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, vl)
@@ -246,15 +246,15 @@ func TestSyncAllEPGAppliesCustomSourcesLast(t *testing.T) {
 	files := newFileServer(t)
 	files.set("/epg.xml", buildXMLTV(
 		[]tvChannel{{id: "1", names: []string{"CCTV-1高清"}}},
-		[]tvProg{{"1", "cust", day, day.Add(time.Hour)}}, // 与 vl-a (00:00-01:00) 重叠
+		[]tvProg{{"1", "cust", day.Add(2 * time.Hour), day.Add(3 * time.Hour)}},
 	))
-	src := &model.CustomSource{Name: "电信", URL: files.URL + "/epg.xml", Enabled: 1, Priority: 10}
+	src := &model.CustomSource{Name: "电信", URL: files.URL + "/epg.xml", Mode: model.CustomSourceModeFull, Enabled: 1}
 	if err := customRepo.Create(context.Background(), src); err != nil {
 		t.Fatal(err)
 	}
 
 	env.scheduler.SyncAllEPG(true)
-	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":cust", "vl:vl-b")
+	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":cust")
 
 	// 自定义源下载失败：不动数据，下一轮强制刷新后频道回到 provider 的完整数据
 	files.remove("/epg.xml")
@@ -264,4 +264,52 @@ func TestSyncAllEPGAppliesCustomSourcesLast(t *testing.T) {
 	if got.LastStatus != model.CustomSourceStatusFailed {
 		t.Errorf("status = %q, want failed", got.LastStatus)
 	}
+}
+
+// 零点补抓（不强制）：当天只有增量源的节目时，内置源照常抓取并换掉它们；
+// 之后增量源再同步时也不会再补这一天
+func TestMidnightSyncReplacesFillPrograms(t *testing.T) {
+	vl := newFakeProvider("vl", 1, map[string]fakeResult{"CCTV1": {titles: []string{"vl-a", "vl-b"}}})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, vl)
+
+	customRepo := postgres.NewCustomSourceRepository(env.db)
+	custom := NewCustomSourceService(customRepo, postgres.NewChannelRepository(env.db), env.programs, cache.NewMemoryCache())
+	env.scheduler.SetCustomSources(custom)
+
+	now := time.Now()
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	files := newFileServer(t)
+	files.set("/fill.xml", buildXMLTV(
+		[]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
+		[]tvProg{{"1", "fill-a", day, day.Add(time.Hour)}, {"1", "fill-b", day.Add(time.Hour), day.Add(2 * time.Hour)}},
+	))
+	src := &model.CustomSource{Name: "补充", URL: files.URL + "/fill.xml", Mode: model.CustomSourceModeFill, Enabled: 1, Priority: 10}
+	if err := customRepo.Create(context.Background(), src); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟前一天提前补进来的数据：只有增量源
+	custom.SyncAll(context.Background())
+	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":fill-a", src.ProviderID()+":fill-b")
+
+	env.scheduler.SyncAllEPG(false)
+
+	if got := vl.requestedChannels(); len(got) != 1 || got[0] != "CCTV1" {
+		t.Errorf("vl requested %v, want CCTV1 (fill-only day must not count as existing)", got)
+	}
+	assertPrograms(t, env.today(t, "CCTV1"), "vl:vl-a", "vl:vl-b")
+}
+
+// 当天已有全量源或内置源的节目时，零点补抓照旧跳过
+func TestMidnightSyncSkipsDaysWithFullPrograms(t *testing.T) {
+	vl := newFakeProvider("vl", 1, map[string]fakeResult{"CCTV1": {titles: []string{"vl-a"}}})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, vl)
+	env.seed(t, "CCTV1", "custom:1", "full-a")
+
+	env.scheduler.SyncAllEPG(false)
+
+	if got := vl.requestedChannels(); len(got) != 0 {
+		t.Errorf("vl requested %v for a day that already has full custom programs", got)
+	}
+	assertPrograms(t, env.today(t, "CCTV1"), "custom:1:full-a")
 }

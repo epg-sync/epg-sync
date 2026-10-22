@@ -44,8 +44,12 @@ func (h *CustomSourceHandler) CreateCustomSource(c *gin.Context) {
 	source := &model.CustomSource{
 		Name:     req.Name,
 		URL:      req.URL,
+		Mode:     model.CustomSourceModeFull,
 		Enabled:  1,
 		Priority: defaultCustomSourcePriority,
+	}
+	if req.Mode != nil {
+		source.Mode = *req.Mode
 	}
 	if req.Enabled != nil {
 		source.Enabled = *req.Enabled
@@ -85,8 +89,12 @@ func (h *CustomSourceHandler) UpdateCustomSource(c *gin.Context) {
 		ID:       id,
 		Name:     req.Name,
 		URL:      req.URL,
+		Mode:     existing.Mode,
 		Enabled:  existing.Enabled,
 		Priority: existing.Priority,
+	}
+	if req.Mode != nil {
+		source.Mode = *req.Mode
 	}
 	if req.Enabled != nil {
 		source.Enabled = *req.Enabled

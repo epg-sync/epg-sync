@@ -64,6 +64,7 @@ func (r *customSourceRepo) Update(ctx context.Context, source *model.CustomSourc
 		Updates(map[string]any{
 			"name":       source.Name,
 			"url":        source.URL,
+			"mode":       source.Mode,
 			"enabled":    source.Enabled,
 			"priority":   source.Priority,
 			"updated_at": source.UpdatedAt,
@@ -94,14 +95,14 @@ func (r *customSourceRepo) SetRunning(ctx context.Context, id int64) error {
 	err := r.db.WithContext(ctx).
 		Model(&model.CustomSource{}).
 		Where("id = ?", id).
-		Updates(map[string]any{"last_status": model.CustomSourceStatusRunning, "last_error": ""}).Error
+		Updates(map[string]any{"last_status": model.CustomSourceStatusRunning, "last_error": "", "last_message": ""}).Error
 	if err != nil {
 		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to mark custom source running")
 	}
 	return nil
 }
 
-func (r *customSourceRepo) SetSyncResult(ctx context.Context, id int64, status, lastError string, programCount int) error {
+func (r *customSourceRepo) SetSyncResult(ctx context.Context, id int64, status, lastError, message string, programCount int) error {
 	err := r.db.WithContext(ctx).
 		Model(&model.CustomSource{}).
 		Where("id = ?", id).
@@ -109,6 +110,7 @@ func (r *customSourceRepo) SetSyncResult(ctx context.Context, id int64, status, 
 			"last_sync_at":  time.Now(),
 			"last_status":   status,
 			"last_error":    lastError,
+			"last_message":  message,
 			"program_count": programCount,
 		}).Error
 	if err != nil {
@@ -121,7 +123,7 @@ func (r *customSourceRepo) ClearSyncResult(ctx context.Context, id int64) error 
 	err := r.db.WithContext(ctx).
 		Model(&model.CustomSource{}).
 		Where("id = ?", id).
-		Updates(map[string]any{"last_status": "", "last_error": "", "program_count": 0}).Error
+		Updates(map[string]any{"last_status": "", "last_error": "", "last_message": "", "program_count": 0}).Error
 	if err != nil {
 		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to clear custom source sync result")
 	}

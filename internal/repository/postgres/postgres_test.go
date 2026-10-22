@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"sort"
 	"testing"
 	"time"
 
@@ -219,7 +220,121 @@ func assertTitles(t *testing.T, got []string, want ...string) {
 	}
 }
 
-func TestReplaceChannelRanges(t *testing.T) {
+func TestReplaceChannelDays(t *testing.T) {
+	db := dbtest.New(t)
+	repo := NewProgramRepository(db)
+	ctx := context.Background()
+
+	cst := time.FixedZone("CST", 8*3600)
+	day := time.Date(2030, 1, 1, 0, 0, 0, 0, cst)
+	hour := func(h int) time.Time { return day.Add(time.Duration(h) * time.Hour) }
+	mk := func(channel, provider, title string, from, to int) *model.Program {
+		return &model.Program{ChannelID: channel, Title: title, ProviderID: provider, StartTime: hour(from), EndTime: hour(to)}
+	}
+	oneDay := func(offset int) model.TimeRange {
+		return model.TimeRange{From: day.AddDate(0, 0, offset), To: day.AddDate(0, 0, offset+1)}
+	}
+
+	if err := repo.CreateBatch(ctx, []*model.Program{
+		mk("CCTV1", "builtin", "prev-late", -1, 1), // 前一天开始、跨过零点：归前一天，保留
+		mk("CCTV1", "builtin", "d0-a", 1, 2),
+		mk("CCTV1", "builtin", "d0-b", 20, 21),
+		mk("CCTV1", "builtin", "d1", 25, 26),
+		mk("CCTV1", "custom:1", "stale-d2", 49, 50), // 本源上次写入的、这次不再写的天，要清掉
+		mk("CCTV2", "builtin", "other", 1, 2),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	write := func() {
+		t.Helper()
+		err := repo.ReplaceChannelDays(ctx, "CCTV1", []model.TimeRange{oneDay(0)}, "custom:1", hour(-24), []*model.Program{
+			mk("CCTV1", "custom:1", "new", 8, 9),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	want := []string{"builtin:prev-late", "custom:1:new", "builtin:d1"}
+	assertTitles(t, titlesOf(t, repo, "CCTV1"), want...)
+	assertTitles(t, titlesOf(t, repo, "CCTV2"), "builtin:other")
+
+	// 重复执行结果不变（幂等）
+	write()
+	assertTitles(t, titlesOf(t, repo, "CCTV1"), want...)
+
+	// days 为空时只清理本源的数据
+	if err := repo.ReplaceChannelDays(ctx, "CCTV1", nil, "custom:1", hour(-24), nil); err != nil {
+		t.Fatal(err)
+	}
+	assertTitles(t, titlesOf(t, repo, "CCTV1"), "builtin:prev-late", "builtin:d1")
+}
+
+func TestListProviderDays(t *testing.T) {
+	db := dbtest.New(t)
+	repo := NewProgramRepository(db)
+	ctx := context.Background()
+
+	// 2030-01-01 23:30 东八区 = 15:30 UTC：按东八区算是 1 号，按 UTC 算也是 1 号；
+	// 2030-01-02 07:30 东八区 = 1 号 23:30 UTC：按东八区算是 2 号
+	at := func(s string) time.Time {
+		tm, err := time.Parse("2006-01-02 15:04 -0700", s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tm
+	}
+	if err := repo.CreateBatch(ctx, []*model.Program{
+		{ChannelID: "CCTV1", Title: "a", ProviderID: "cctv_cn", StartTime: at("2030-01-01 23:30 +0800"), EndTime: at("2030-01-02 00:30 +0800")},
+		{ChannelID: "CCTV1", Title: "b", ProviderID: "cctv_cn", StartTime: at("2030-01-02 07:30 +0800"), EndTime: at("2030-01-02 08:30 +0800")},
+		{ChannelID: "CCTV1", Title: "c", ProviderID: "custom-fill:3", StartTime: at("2030-01-02 09:00 +0800"), EndTime: at("2030-01-02 10:00 +0800")},
+		{ChannelID: "CCTV2", Title: "x", ProviderID: "cctv_cn", StartTime: at("2030-01-02 09:00 +0800"), EndTime: at("2030-01-02 10:00 +0800")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	days, err := repo.ListProviderDays(ctx, "CCTV1", "Asia/Shanghai", at("2030-01-01 00:00 +0800"), at("2030-01-03 00:00 +0800"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(days))
+	for i, d := range days {
+		got[i] = d.ProviderID + "@" + d.Day
+	}
+	sort.Strings(got)
+	assertTitles(t, got, "cctv_cn@2030-01-01", "cctv_cn@2030-01-02", "custom-fill:3@2030-01-02")
+}
+
+func TestExistsIgnoresFillPrograms(t *testing.T) {
+	db := dbtest.New(t)
+	repo := NewProgramRepository(db)
+	ctx := context.Background()
+
+	day := time.Date(2030, 1, 1, 0, 0, 0, 0, time.Local)
+	add := func(channel, provider string) {
+		t.Helper()
+		if err := repo.CreateBatch(ctx, []*model.Program{{ChannelID: channel, Title: "p", ProviderID: provider,
+			StartTime: day.Add(time.Hour), EndTime: day.Add(2 * time.Hour)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("CCTV1", "custom-fill:1")
+	add("CCTV2", "custom:1")
+	add("CCTV3", "cctv_cn")
+
+	for channel, want := range map[string]bool{"CCTV1": false, "CCTV2": true, "CCTV3": true, "CCTV4": false} {
+		got, err := repo.Exists(ctx, channel, day)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("Exists(%s) = %v, want %v", channel, got, want)
+		}
+	}
+}
+
+func TestCreateBatchReplacingFill(t *testing.T) {
 	db := dbtest.New(t)
 	repo := NewProgramRepository(db)
 	ctx := context.Background()
@@ -229,80 +344,24 @@ func TestReplaceChannelRanges(t *testing.T) {
 	mk := func(channel, provider, title string, from, to int) *model.Program {
 		return &model.Program{ChannelID: channel, Title: title, ProviderID: provider, StartTime: hour(from), EndTime: hour(to)}
 	}
-	rg := func(from, to int) model.TimeRange { return model.TimeRange{From: hour(from), To: hour(to)} }
-
-	seed := []*model.Program{
-		mk("CCTV1", "builtin", "early", 0, 6),
-		mk("CCTV1", "builtin", "straddle", 6, 9),
-		mk("CCTV1", "builtin", "mid", 9, 10),
-		mk("CCTV1", "builtin", "gap-a", 10, 12),
-		mk("CCTV1", "builtin", "gap-b", 12, 14),
-		mk("CCTV1", "builtin", "evening", 14, 16),
-		mk("CCTV1", "builtin", "late", 16, 18),
-		mk("CCTV2", "builtin", "other", 7, 8),
-		// 本源上次同步留下的、这次时间段之外的旧节目
-		mk("CCTV1", "custom:1", "stale", 20, 21),
-	}
-	if err := repo.CreateBatch(ctx, seed); err != nil {
+	if err := repo.CreateBatch(ctx, []*model.Program{
+		mk("CCTV1", "custom-fill:1", "fill-in", 1, 2),
+		mk("CCTV1", "custom-fill:1", "fill-out", 10, 11), // 在新节目范围之外，留给自定义源同步时清理
+		mk("CCTV1", "custom:2", "full", 2, 3),            // 全量源的节目不受影响
+		mk("CCTV2", "custom-fill:1", "fill-other", 1, 2), // 其它频道不受影响
+	}); err != nil {
 		t.Fatal(err)
 	}
 
-	// 这次覆盖两段：07-10 和 14-16，中间 10-14 是空档。
-	// 与这两段重叠的 straddle、mid、evening 被删；early、late 只是相邻，空档里的 gap-a、gap-b 都必须保留；
-	// 本源的 stale 也要清掉；另一个频道不受影响
-	write := func() {
-		t.Helper()
-		err := repo.ReplaceChannelRanges(ctx, "CCTV1", []model.TimeRange{rg(7, 10), rg(14, 16)}, "custom:1", hour(0), []*model.Program{
-			mk("CCTV1", "custom:1", "new-a", 7, 8),
-			mk("CCTV1", "custom:1", "new-b", 8, 10),
-			mk("CCTV1", "custom:1", "new-c", 14, 16),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	write()
-	want := []string{"builtin:early", "custom:1:new-a", "custom:1:new-b", "builtin:gap-a", "builtin:gap-b", "custom:1:new-c", "builtin:late"}
-	assertTitles(t, titlesOf(t, repo, "CCTV1"), want...)
-	assertTitles(t, titlesOf(t, repo, "CCTV2"), "builtin:other")
-
-	// 重复执行结果不变（幂等）
-	write()
-	assertTitles(t, titlesOf(t, repo, "CCTV1"), want...)
-}
-
-// 时间段很多时要拆成多条 DELETE，不能超过参数上限
-func TestReplaceChannelRangesManyRanges(t *testing.T) {
-	db := dbtest.New(t)
-	repo := NewProgramRepository(db)
-	ctx := context.Background()
-
-	start := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
-	var builtin, custom []*model.Program
-	var ranges []model.TimeRange
-	for i := range 2500 {
-		// 每 10 分钟一档：前 5 分钟是自定义节目，后 5 分钟是空档，空档里有一条内置节目
-		s := start.Add(time.Duration(i) * 10 * time.Minute)
-		custom = append(custom, &model.Program{ChannelID: "CCTV1", Title: "c", ProviderID: "custom:1", StartTime: s, EndTime: s.Add(5 * time.Minute)})
-		ranges = append(ranges, model.TimeRange{From: s, To: s.Add(5 * time.Minute)})
-		builtin = append(builtin, &model.Program{ChannelID: "CCTV1", Title: "b", ProviderID: "builtin", StartTime: s.Add(5 * time.Minute), EndTime: s.Add(10 * time.Minute)})
-		builtin = append(builtin, &model.Program{ChannelID: "CCTV1", Title: "x", ProviderID: "builtin", StartTime: s, EndTime: s.Add(5 * time.Minute)})
-	}
-	if err := repo.CreateBatch(ctx, builtin); err != nil {
-		t.Fatal(err)
-	}
-	if err := repo.ReplaceChannelRanges(ctx, "CCTV1", ranges, "custom:1", start, custom); err != nil {
+	if err := repo.CreateBatchReplacingFill(ctx, []*model.Program{
+		mk("CCTV1", "cctv_cn", "b0", 0, 1),
+		mk("CCTV1", "cctv_cn", "b1", 1, 3),
+	}); err != nil {
 		t.Fatal(err)
 	}
 
-	var counts []struct {
-		ProviderID string
-		N          int
-	}
-	db.Model(&model.Program{}).Select("provider_id, count(*) AS n").Group("provider_id").Order("provider_id").Scan(&counts)
-	if len(counts) != 2 || counts[0].ProviderID != "builtin" || counts[0].N != 2500 || counts[1].N != 2500 {
-		t.Fatalf("counts = %+v, want 2500 builtin (gaps kept) + 2500 custom", counts)
-	}
+	assertTitles(t, titlesOf(t, repo, "CCTV1"), "cctv_cn:b0", "cctv_cn:b1", "custom:2:full", "custom-fill:1:fill-out")
+	assertTitles(t, titlesOf(t, repo, "CCTV2"), "custom-fill:1:fill-other")
 }
 
 func TestDeleteByProviderOutsideChannels(t *testing.T) {
