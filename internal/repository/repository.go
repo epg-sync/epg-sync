@@ -50,6 +50,8 @@ type ProgramRepository interface {
 	// ListProviderDays 列出频道在 [from, to) 内各 provider 有节目的日期，日期按 timezone 计算，按开始时间归属
 	ListProviderDays(ctx context.Context, channelID, timezone string, from, to time.Time) ([]*model.ProviderDay, error)
 	DeleteByProviderID(ctx context.Context, providerID string) (int64, error)
+	// ListChannelIDsByProvider 列出 providerID 写入过节目的频道
+	ListChannelIDsByProvider(ctx context.Context, providerID string) ([]string, error)
 	// DeleteByProviderOutsideChannels 删除 providerID 写入的、结束时间晚于 after、且频道不在 keep 中的节目
 	DeleteByProviderOutsideChannels(ctx context.Context, providerID string, keep []string, after time.Time) (int64, error)
 	// Exists 判断频道在 date 当天是否已有节目。增量源（custom-fill:）的节目不算，内置源会照常抓取并换掉它们

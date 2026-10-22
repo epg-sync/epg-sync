@@ -339,6 +339,20 @@ func (r *programRepo) DeleteByProviderOutsideChannels(ctx context.Context, provi
 	return result.RowsAffected, nil
 }
 
+func (r *programRepo) ListChannelIDsByProvider(ctx context.Context, providerID string) ([]string, error) {
+	var ids []string
+	err := r.db.WithContext(ctx).
+		Model(&model.Program{}).
+		Distinct("channel_id").
+		Where("provider_id = ?", providerID).
+		Order("channel_id").
+		Pluck("channel_id", &ids).Error
+	if err != nil {
+		return nil, errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to list channels by provider")
+	}
+	return ids, nil
+}
+
 func (r *programRepo) DeleteByProviderID(ctx context.Context, providerID string) (int64, error) {
 	result := r.db.WithContext(ctx).Where("provider_id = ?", providerID).Delete(&model.Program{})
 	if result.Error != nil {

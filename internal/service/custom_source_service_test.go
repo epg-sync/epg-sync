@@ -62,15 +62,17 @@ type fileServer struct {
 	*httptest.Server
 	mu    sync.Mutex
 	files map[string]string
+	hits  map[string]int
 	gate  chan struct{} // 非 nil 时，请求会阻塞到它被关闭
 }
 
 func newFileServer(t *testing.T) *fileServer {
 	t.Helper()
-	fs := &fileServer{files: map[string]string{}}
+	fs := &fileServer{files: map[string]string{}, hits: map[string]int{}}
 	fs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fs.mu.Lock()
 		content, ok := fs.files[r.URL.Path]
+		fs.hits[r.URL.Path]++
 		gate := fs.gate
 		fs.mu.Unlock()
 		if gate != nil {
@@ -98,6 +100,13 @@ func (fs *fileServer) set(path, content string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.files[path] = content
+}
+
+// hitCount 返回 path 被请求的次数
+func (fs *fileServer) hitCount(path string) int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.hits[path]
 }
 
 func (fs *fileServer) remove(path string) {
@@ -459,8 +468,8 @@ func TestCustomSourceDisabledIsIgnored(t *testing.T) {
 func TestCustomSourceDeleteFullPurgesAndRefills(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
-	refilled := make(chan struct{}, 1)
-	e.svc.SetRefill(func() { refilled <- struct{}{} })
+	refilled := make(chan []string, 1)
+	e.svc.SetRefill(func(channels []string) { refilled <- channels })
 
 	e.seedBuiltin(t, "CCTV1")
 	e.files.set("/epg.xml", buildXMLTV(
@@ -480,8 +489,10 @@ func TestCustomSourceDeleteFullPurgesAndRefills(t *testing.T) {
 	// 全量源占过的那天已经没有数据，要等补抓
 	assertPrograms(t, e.listed(t, "CCTV1"))
 	assertPrograms(t, e.listed(t, "本地台"))
+	// 只补抓它占用过的频道
 	select {
-	case <-refilled:
+	case channels := <-refilled:
+		assertPrograms(t, channels, "CCTV1", "本地台")
 	case <-time.After(time.Second):
 		t.Fatal("refill was not triggered after deleting a full source")
 	}
@@ -615,8 +626,8 @@ func TestCustomSourceStartSyncRejectsDisabled(t *testing.T) {
 func TestCustomSourceDisableFullPurgesAndRefills(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
-	refilled := make(chan struct{}, 1)
-	e.svc.SetRefill(func() { refilled <- struct{}{} })
+	refilled := make(chan []string, 1)
+	e.svc.SetRefill(func(channels []string) { refilled <- channels })
 
 	e.seedBuiltin(t, "CCTV1")
 	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
@@ -634,7 +645,8 @@ func TestCustomSourceDisableFullPurgesAndRefills(t *testing.T) {
 	}
 	assertPrograms(t, e.listed(t, "CCTV1"))
 	select {
-	case <-refilled:
+	case channels := <-refilled:
+		assertPrograms(t, channels, "CCTV1")
 	case <-time.After(time.Second):
 		t.Fatal("refill was not triggered after disabling a full source")
 	}
@@ -872,10 +884,11 @@ func TestCustomSourceManualSyncKeepsPriority(t *testing.T) {
 	assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
 }
 
-// 停用增量源：清除它补的节目，低优先级增量源接手
+// 停用增量源：清除它补的节目，低优先级增量源接手；不需要补抓内置节目
 func TestCustomSourceDisableFillRestoresLower(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
+	e.svc.SetRefill(func(channels []string) { t.Errorf("refill called for a fill source: %v", channels) })
 	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
 	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
 	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))

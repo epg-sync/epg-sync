@@ -50,8 +50,8 @@ type CustomSourceService struct {
 	programRepo repository.ProgramRepository
 	cache       cache.Cache
 
-	// refill 在全量源的数据被清除后调用，补抓被它占用的那些天的内置节目（并重新同步自定义源）
-	refill func()
+	// refill 在全量源的数据被清除后调用，传入它占用过的频道：补抓这些频道的内置节目，再重新同步自定义源
+	refill func(channelIDs []string)
 
 	mu sync.Mutex // 同一时间只允许一个任务写库，避免定时任务、手动同步、停用、删除相互覆盖
 }
@@ -65,9 +65,9 @@ func NewCustomSourceService(
 	return &CustomSourceService{repo: repo, channelRepo: channelRepo, programRepo: programRepo, cache: cache}
 }
 
-// SetRefill 设置全量源的数据被清除后要执行的补抓，通常是在后台跑一次不强制刷新的全量同步。
-// 未设置时只重新同步自定义源
-func (s *CustomSourceService) SetRefill(refill func()) {
+// SetRefill 设置全量源的数据被清除后要执行的补抓，通常是 SchedulerService.RefillChannels。
+// 它应当在后台执行并立即返回，补抓结束时重新同步自定义源。未设置时只重新同步自定义源
+func (s *CustomSourceService) SetRefill(refill func(channelIDs []string)) {
 	s.refill = refill
 }
 
@@ -131,7 +131,7 @@ func (s *CustomSourceService) Update(ctx context.Context, src *model.CustomSourc
 			return nil, ErrSyncInProgress
 		}
 		// 先清节目再改记录：清除失败时记录不变，可以重试
-		err := s.purgeLocked(ctx, old)
+		channels, err := s.purgeLocked(ctx, old)
 		if err == nil {
 			err = s.repo.Update(ctx, src)
 		}
@@ -139,7 +139,7 @@ func (s *CustomSourceService) Update(ctx context.Context, src *model.CustomSourc
 		if err != nil {
 			return nil, err
 		}
-		s.afterPurge(old)
+		s.afterPurge(old, channels)
 		return s.repo.GetByID(ctx, src.ID)
 	}
 
@@ -163,7 +163,7 @@ func (s *CustomSourceService) Delete(ctx context.Context, id int64) error {
 	if !s.mu.TryLock() {
 		return ErrSyncInProgress
 	}
-	deleted, err := s.programRepo.DeleteByProviderID(ctx, src.ProviderID())
+	channels, err := s.purgeLocked(ctx, src)
 	if err == nil {
 		err = s.repo.Delete(ctx, id)
 	}
@@ -172,39 +172,40 @@ func (s *CustomSourceService) Delete(ctx context.Context, id int64) error {
 		return err
 	}
 
-	s.invalidateXMLTVCache(ctx)
-	logger.Info("Deleted custom source",
-		logger.Int64("id", id),
-		logger.String("name", src.Name),
-		logger.Int64("programs_deleted", deleted),
-	)
-	s.afterPurge(src)
+	logger.Info("Deleted custom source", logger.Int64("id", id), logger.String("name", src.Name))
+	s.afterPurge(src, channels)
 	return nil
 }
 
-// purgeLocked 清除一个源写入的全部节目和同步状态。调用方负责持有 s.mu
-func (s *CustomSourceService) purgeLocked(ctx context.Context, src *model.CustomSource) error {
+// purgeLocked 清除一个源写入的全部节目和同步状态，返回这些节目所在的频道。调用方负责持有 s.mu
+func (s *CustomSourceService) purgeLocked(ctx context.Context, src *model.CustomSource) ([]string, error) {
+	channels, err := s.programRepo.ListChannelIDsByProvider(ctx, src.ProviderID())
+	if err != nil {
+		return nil, err
+	}
 	deleted, err := s.programRepo.DeleteByProviderID(ctx, src.ProviderID())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.repo.ClearSyncResult(ctx, src.ID); err != nil {
-		return err
+		return nil, err
 	}
 	s.invalidateXMLTVCache(ctx)
 	logger.Info("Purged programs of custom source",
 		logger.Int64("id", src.ID),
 		logger.String("name", src.Name),
 		logger.Int64("programs_deleted", deleted),
+		logger.Int("channels", len(channels)),
 	)
-	return nil
+	return channels, nil
 }
 
 // afterPurge 在一个源的数据被清除后，让空出来的「频道+天」重新有数据：
-// 全量源占过的天要补抓内置节目（refill 会顺带重新同步自定义源），增量源只需重新同步其余的源
-func (s *CustomSourceService) afterPurge(src *model.CustomSource) {
-	if !src.IsFill() && s.refill != nil {
-		s.refill()
+// 全量源占过的频道要补抓内置节目（只补这些频道，refill 结束时会重新同步自定义源）；
+// 增量源只需重新同步其余的源
+func (s *CustomSourceService) afterPurge(src *model.CustomSource, channels []string) {
+	if !src.IsFill() && s.refill != nil && len(channels) > 0 {
+		s.refill(channels)
 		return
 	}
 	s.startAllQuietly()
