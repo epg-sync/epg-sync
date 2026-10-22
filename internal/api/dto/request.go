@@ -20,12 +20,14 @@ type BatchCreateChannelRequest struct {
 	Channels []CreateChannelRequest `json:"channels" binding:"required,dive,required"`
 }
 
-// CustomSourceRequest 用于创建和更新自定义数据源。enabled 缺省为 1；priority 缺省时创建为 100、更新保持不变，数字越小优先级越高
+// CustomSourceRequest 用于创建和更新自定义数据源。省略的字段：创建时 mode 为 full、enabled 为 1、priority 为 100，
+// 更新时保持不变。mode：full 全量覆盖、fill 增量补充；priority 只对增量源有意义，数字越小优先级越高
 type CustomSourceRequest struct {
-	Name     string `json:"name" binding:"required"`
-	URL      string `json:"url" binding:"required"`
-	Enabled  *int   `json:"enabled" binding:"omitempty,oneof=0 1"`
-	Priority *int   `json:"priority" binding:"omitempty,min=0,max=100000"`
+	Name     string  `json:"name" binding:"required"`
+	URL      string  `json:"url" binding:"required"`
+	Mode     *string `json:"mode" binding:"omitempty,oneof=full fill"`
+	Enabled  *int    `json:"enabled" binding:"omitempty,oneof=0 1"`
+	Priority *int    `json:"priority" binding:"omitempty,min=0,max=100000"`
 }
 
 type GetEPGRequest struct {

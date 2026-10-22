@@ -19,11 +19,16 @@ import (
 )
 
 const (
-	// 只导入这个窗口内的节目：往前 48 小时（XMLTV 输出含昨天）、往后 7 天（和 7 天的清理周期一致）
+	// 下载时先按这个窗口粗筛节目，写库时再按频道时区精确到天（见 dayWindow）
 	customSourcePast   = 48 * time.Hour
 	customSourceFuture = 7 * 24 * time.Hour
 
+	// 写库的日期范围：昨天（XMLTV 输出含昨天）到今天之后第 6 天，共 8 天
+	customSourceDaysBefore = 1
+	customSourceDaysAfter  = 6
+
 	defaultChannelTimezone = "Asia/Shanghai"
+	dayLayout              = "2006-01-02"
 )
 
 // ErrSyncInProgress 表示已有自定义源在同步，同一时间只允许一个同步任务写库
@@ -31,17 +36,22 @@ var ErrSyncInProgress = errors.New(errors.ErrCodeAlreadyExists, "custom source s
 
 // CustomSourceService 管理用户配置的 XMLTV 文件源，并把文件里的节目导入数据库。
 //
-// 导入以「时间段」为单位覆盖：文件里节目连续覆盖到的时间段以文件为准（不论原来是哪个 provider 写的），
-// 文件没覆盖到的时间段（包括节目之间的空档）保留原有节目。
-// 调度时它在所有 provider 之后执行，所以始终优先于内置源。
+// 数据以「频道+天」为单位归属，分三层，前面的优先：
+//  1. 全量源（mode=full）：文件里某频道某天有节目，这一天就整天以文件为准，覆盖内置源。
+//     多个全量源争同一天时，先添加的（id 小的）优先
+//  2. 内置 provider
+//  3. 增量源（mode=fill）：只补前两层当天都没有节目的「频道+天」，增量源之间按 priority（数字小的优先）
 //
-// 多个源之间靠写入顺序体现优先级：优先级低的先写、高的后写。所以任何一次同步都必须按优先级
-// 跑完所有已启用的源，单独同步某一个源会让它盖掉优先级更高的源
+// 调度时自定义源在所有 provider 之后执行。每次同步都按上面的顺序跑完所有已启用的源，
+// 每个源只写它有权写的天，所以结果与执行先后无关
 type CustomSourceService struct {
 	repo        repository.CustomSourceRepository
 	channelRepo repository.ChannelRepository
 	programRepo repository.ProgramRepository
 	cache       cache.Cache
+
+	// refill 在全量源的数据被清除后调用，传入它占用过的频道：补抓这些频道的内置节目，再重新同步自定义源
+	refill func(channelIDs []string)
 
 	mu sync.Mutex // 同一时间只允许一个任务写库，避免定时任务、手动同步、停用、删除相互覆盖
 }
@@ -53,6 +63,12 @@ func NewCustomSourceService(
 	cache cache.Cache,
 ) *CustomSourceService {
 	return &CustomSourceService{repo: repo, channelRepo: channelRepo, programRepo: programRepo, cache: cache}
+}
+
+// SetRefill 设置全量源的数据被清除后要执行的补抓，通常是 SchedulerService.RefillChannels。
+// 它应当在后台执行并立即返回，补抓结束时重新同步自定义源。未设置时只重新同步自定义源
+func (s *CustomSourceService) SetRefill(refill func(channelIDs []string)) {
+	s.refill = refill
 }
 
 // ResetStale 把进程中途退出留下的 running 状态改为 failed，启动时调用
@@ -77,10 +93,13 @@ func validateCustomSource(src *model.CustomSource) error {
 	if err := xmltv.ValidateURL(src.URL); err != nil {
 		return errors.InvalidParam("url", err.Error())
 	}
+	if src.Mode != model.CustomSourceModeFull && src.Mode != model.CustomSourceModeFill {
+		return errors.InvalidParam("mode", "mode must be full or fill")
+	}
 	return nil
 }
 
-// Create 保存新的数据源；已启用时在后台按优先级同步一次全部已启用的源
+// Create 保存新的数据源；已启用时在后台同步一次全部已启用的源
 func (s *CustomSourceService) Create(ctx context.Context, src *model.CustomSource) (*model.CustomSource, error) {
 	if err := validateCustomSource(src); err != nil {
 		return nil, err
@@ -94,9 +113,9 @@ func (s *CustomSourceService) Create(ctx context.Context, src *model.CustomSourc
 	return src, nil
 }
 
-// Update 更新 name / url / enabled / priority。
-// 停用时清除它写入的节目，再重新同步其余的源，让被它覆盖掉的低优先级源的数据回来；
-// 新启用或改了地址时在后台重新同步
+// Update 更新 name / url / mode / enabled / priority。
+// 停用或切换模式时，先清除它按原模式写入的节目，再补抓和重新同步；
+// 新启用、改了地址、增量源改了优先级时在后台重新同步
 func (s *CustomSourceService) Update(ctx context.Context, src *model.CustomSource) (*model.CustomSource, error) {
 	if err := validateCustomSource(src); err != nil {
 		return nil, err
@@ -105,13 +124,14 @@ func (s *CustomSourceService) Update(ctx context.Context, src *model.CustomSourc
 	if err != nil {
 		return nil, err
 	}
+	modeChanged := old.Mode != src.Mode
 
-	if old.Enabled == 1 && src.Enabled != 1 {
+	if old.Enabled == 1 && (src.Enabled != 1 || modeChanged) {
 		if !s.mu.TryLock() {
 			return nil, ErrSyncInProgress
 		}
-		// 先清节目再改状态：清除失败时源仍是启用状态，可以重试
-		err := s.purgeLocked(ctx, old)
+		// 先清节目再改记录：清除失败时记录不变，可以重试
+		channels, err := s.purgeLocked(ctx, old)
 		if err == nil {
 			err = s.repo.Update(ctx, src)
 		}
@@ -119,21 +139,21 @@ func (s *CustomSourceService) Update(ctx context.Context, src *model.CustomSourc
 		if err != nil {
 			return nil, err
 		}
-		s.startAllQuietly()
+		s.afterPurge(old, channels)
 		return s.repo.GetByID(ctx, src.ID)
 	}
 
 	if err := s.repo.Update(ctx, src); err != nil {
 		return nil, err
 	}
-	if src.Enabled == 1 && (old.Enabled != 1 || old.URL != src.URL) {
+	if src.Enabled == 1 && (old.Enabled != 1 || old.URL != src.URL || modeChanged ||
+		(src.IsFill() && old.Priority != src.Priority)) {
 		s.startAllQuietly()
 	}
 	return s.repo.GetByID(ctx, src.ID)
 }
 
-// Delete 删除数据源并清理它写入的节目，然后重新同步其余的源（被覆盖掉的内置节目要等下一次全量同步才会补回来）。
-// 自动创建的频道保留，可以在频道管理页手动删除
+// Delete 删除数据源并清理它写入的节目，然后补抓和重新同步。自动创建的频道保留，可以在频道管理页手动删除
 func (s *CustomSourceService) Delete(ctx context.Context, id int64) error {
 	src, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -143,7 +163,7 @@ func (s *CustomSourceService) Delete(ctx context.Context, id int64) error {
 	if !s.mu.TryLock() {
 		return ErrSyncInProgress
 	}
-	deleted, err := s.programRepo.DeleteByProviderID(ctx, src.ProviderID())
+	channels, err := s.purgeLocked(ctx, src)
 	if err == nil {
 		err = s.repo.Delete(ctx, id)
 	}
@@ -152,36 +172,46 @@ func (s *CustomSourceService) Delete(ctx context.Context, id int64) error {
 		return err
 	}
 
-	s.invalidateXMLTVCache(ctx)
-	logger.Info("Deleted custom source",
-		logger.Int64("id", id),
-		logger.String("name", src.Name),
-		logger.Int64("programs_deleted", deleted),
-	)
-	s.startAllQuietly()
+	logger.Info("Deleted custom source", logger.Int64("id", id), logger.String("name", src.Name))
+	s.afterPurge(src, channels)
 	return nil
 }
 
-// purgeLocked 清除一个源写入的全部节目和同步状态。调用方负责持有 s.mu
-func (s *CustomSourceService) purgeLocked(ctx context.Context, src *model.CustomSource) error {
+// purgeLocked 清除一个源写入的全部节目和同步状态，返回这些节目所在的频道。调用方负责持有 s.mu
+func (s *CustomSourceService) purgeLocked(ctx context.Context, src *model.CustomSource) ([]string, error) {
+	channels, err := s.programRepo.ListChannelIDsByProvider(ctx, src.ProviderID())
+	if err != nil {
+		return nil, err
+	}
 	deleted, err := s.programRepo.DeleteByProviderID(ctx, src.ProviderID())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := s.repo.ClearSyncResult(ctx, src.ID); err != nil {
-		return err
+		return nil, err
 	}
 	s.invalidateXMLTVCache(ctx)
-	logger.Info("Purged programs of disabled custom source",
+	logger.Info("Purged programs of custom source",
 		logger.Int64("id", src.ID),
 		logger.String("name", src.Name),
 		logger.Int64("programs_deleted", deleted),
+		logger.Int("channels", len(channels)),
 	)
-	return nil
+	return channels, nil
 }
 
-// StartSync 是「立即同步」按钮：在后台按优先级同步全部已启用的源并立即返回。
-// 不能只同步 id 这一个，否则它会盖掉优先级更高的源。id 对应的源必须是启用状态；
+// afterPurge 在一个源的数据被清除后，让空出来的「频道+天」重新有数据：
+// 全量源占过的频道要补抓内置节目（只补这些频道，refill 结束时会重新同步自定义源）；
+// 增量源只需重新同步其余的源
+func (s *CustomSourceService) afterPurge(src *model.CustomSource, channels []string) {
+	if !src.IsFill() && s.refill != nil && len(channels) > 0 {
+		s.refill(channels)
+		return
+	}
+	s.startAllQuietly()
+}
+
+// StartSync 是「立即同步」按钮：在后台同步全部已启用的源并立即返回。id 对应的源必须是启用状态；
 // 已有同步在进行时返回 ErrSyncInProgress
 func (s *CustomSourceService) StartSync(ctx context.Context, id int64) error {
 	src, err := s.repo.GetByID(ctx, id)
@@ -194,7 +224,7 @@ func (s *CustomSourceService) StartSync(ctx context.Context, id int64) error {
 	return s.startAll(ctx)
 }
 
-// startAll 在后台按优先级同步全部已启用的源。返回前已把它们标记为 running
+// startAll 在后台同步全部已启用的源。返回前已把它们标记为 running
 func (s *CustomSourceService) startAll(ctx context.Context) error {
 	if !s.mu.TryLock() {
 		return ErrSyncInProgress
@@ -219,7 +249,7 @@ func (s *CustomSourceService) startAllQuietly() {
 	}
 }
 
-// SyncAll 按优先级同步所有已启用的数据源，供定时任务调用；已有同步在进行时直接跳过。
+// SyncAll 同步所有已启用的数据源，供定时任务调用；已有同步在进行时直接跳过。
 // 单个源失败只记在它自己的状态上，不影响其它源
 func (s *CustomSourceService) SyncAll(ctx context.Context) {
 	if !s.mu.TryLock() {
@@ -237,7 +267,6 @@ func (s *CustomSourceService) SyncAll(ctx context.Context) {
 	s.runLocked(ctx, sources)
 }
 
-// enabledSources 返回已启用的源，按 priority、id 升序
 func (s *CustomSourceService) enabledSources(ctx context.Context) ([]*model.CustomSource, error) {
 	all, err := s.repo.List(ctx)
 	if err != nil {
@@ -260,34 +289,74 @@ func (s *CustomSourceService) markRunning(ctx context.Context, sources []*model.
 	}
 }
 
-// runLocked 倒序处理按 priority 升序排好的源：数字大的先写、数字小的后写，让优先级高的最终覆盖。
-// 调用方负责持有 s.mu
+// sourceOrder 返回处理顺序，也就是优先顺序：先全量源（先添加的在前），再增量源（priority 小的在前）
+func sourceOrder(sources []*model.CustomSource) []*model.CustomSource {
+	ordered := append([]*model.CustomSource(nil), sources...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		a, b := ordered[i], ordered[j]
+		if a.IsFill() != b.IsFill() {
+			return !a.IsFill()
+		}
+		if a.IsFill() && a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
+		return a.ID < b.ID
+	})
+	return ordered
+}
+
+// dayOwner 判断某个 provider 在某天的节目会不会挡住 src 写入这一天
+type dayOwner func(providerID string) bool
+
+// blockedBy 返回挡住 src 的 provider：全量源只让给排在它前面的全量源；
+// 增量源让给内置源、全量源和排在它前面的增量源。排在后面的源以及它自己的旧数据都会被换掉
+func blockedBy(src *model.CustomSource, earlier []*model.CustomSource) dayOwner {
+	before := make(map[string]bool, len(earlier))
+	for _, e := range earlier {
+		before[e.ProviderID()] = true
+	}
+	if !src.IsFill() {
+		return func(providerID string) bool { return before[providerID] }
+	}
+	return func(providerID string) bool {
+		if strings.HasPrefix(providerID, model.CustomSourceFillProviderPrefix) {
+			return before[providerID]
+		}
+		return true
+	}
+}
+
+// runLocked 按优先顺序同步各个源。调用方负责持有 s.mu
 func (s *CustomSourceService) runLocked(ctx context.Context, sources []*model.CustomSource) {
-	for i := len(sources) - 1; i >= 0; i-- {
-		s.syncOne(ctx, sources[i])
+	ordered := sourceOrder(sources)
+	for i, src := range ordered {
+		s.syncOne(ctx, src, blockedBy(src, ordered[:i]))
 	}
 }
 
 // syncOne 导入一个源并把结果写回它的状态。调用方负责持有 s.mu
-func (s *CustomSourceService) syncOne(ctx context.Context, src *model.CustomSource) {
+func (s *CustomSourceService) syncOne(ctx context.Context, src *model.CustomSource, blocked dayOwner) {
 	started := time.Now()
-	count, err := s.importSource(ctx, src)
+	res, err := s.importSource(ctx, src, blocked)
 
-	status, msg := model.CustomSourceStatusSuccess, ""
+	status, msg, note := model.CustomSourceStatusSuccess, "", res.note(src)
+	count := res.programs
 	if err != nil {
 		status, msg = model.CustomSourceStatusFailed, err.Error()
 		logger.Error("Custom source sync failed",
 			logger.Int64("id", src.ID), logger.String("name", src.Name), logger.Err(err))
 		if count == 0 {
 			count = src.ProgramCount // 完全失败时保留上次的节目数
+			note = ""
 		}
 	} else {
 		logger.Info("Custom source synced",
-			logger.Int64("id", src.ID), logger.String("name", src.Name),
-			logger.Int("programs", count), logger.Duration("took", time.Since(started)))
+			logger.Int64("id", src.ID), logger.String("name", src.Name), logger.String("mode", src.Mode),
+			logger.Int("programs", res.programs), logger.Int("days_written", res.daysWritten),
+			logger.Int("days_skipped", res.daysSkipped), logger.Duration("took", time.Since(started)))
 	}
 
-	if err := s.repo.SetSyncResult(ctx, src.ID, status, msg, count); err != nil {
+	if err := s.repo.SetSyncResult(ctx, src.ID, status, msg, note, count); err != nil {
 		logger.Error("Failed to save custom source sync result", logger.Err(err), logger.Int64("id", src.ID))
 	}
 	s.invalidateXMLTVCache(ctx)
@@ -297,40 +366,84 @@ func (s *CustomSourceService) invalidateXMLTVCache(ctx context.Context) {
 	s.cache.Delete(ctx, xmltvCacheKey(time.Now()))
 }
 
-// importSource 下载、解析并写库，返回写入的节目数。文件里没有可用节目时返回错误且不动现有数据
-func (s *CustomSourceService) importSource(ctx context.Context, src *model.CustomSource) (int, error) {
+type importResult struct {
+	programs    int // 写入的节目数
+	daysWritten int // 写入的「频道+天」数
+	daysSkipped int // 因被更优先的数据占用而跳过的「频道+天」数
+}
+
+// note 是同步成功时显示给用户的说明
+func (r importResult) note(src *model.CustomSource) string {
+	if src.IsFill() {
+		return fmt.Sprintf("补充了 %d 个频道日，%d 个频道日已有节目", r.daysWritten, r.daysSkipped)
+	}
+	if r.daysSkipped > 0 {
+		return fmt.Sprintf("%d 个频道日已被先添加的全量源占用，已跳过", r.daysSkipped)
+	}
+	return ""
+}
+
+// dayWindow 返回频道时区下要写库的日期范围 [昨天 00:00, 今天之后第 7 天 00:00)
+func dayWindow(now time.Time, loc *time.Location) (time.Time, time.Time) {
+	local := now.In(loc)
+	today := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
+	return today.AddDate(0, 0, -customSourceDaysBefore), today.AddDate(0, 0, customSourceDaysAfter+1)
+}
+
+// channelLocation 返回频道的时区及其名称（名称也用于数据库按天统计，两边必须一致）
+func channelLocation(ch *model.Channel) (*time.Location, string) {
+	if ch.Timezone != "" {
+		if loc, err := time.LoadLocation(ch.Timezone); err == nil {
+			return loc, ch.Timezone
+		}
+	}
+	return xmltv.DefaultLocation, defaultChannelTimezone
+}
+
+// channelPlan 是一个频道这次要写入的内容
+type channelPlan struct {
+	channel  *model.Channel
+	loc      *time.Location
+	tz       string
+	from, to time.Time                   // dayWindow
+	byDay    map[string][]*model.Program // 日期 -> 当天节目（按开始时间归属）
+}
+
+// importSource 下载、解析并写库。文件里没有可用节目时返回错误且不动现有数据
+func (s *CustomSourceService) importSource(ctx context.Context, src *model.CustomSource, blocked dayOwner) (importResult, error) {
+	var res importResult
 	now := time.Now()
 	win := xmltv.Window{From: now.Add(-customSourcePast), To: now.Add(customSourceFuture)}
 
 	rc, err := xmltv.Fetch(ctx, src.URL, provider.DefaultUserAgent)
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 	defer rc.Close()
 
-	res, err := xmltv.Parse(rc, win)
+	parsed, err := xmltv.Parse(rc, win)
 	if err != nil {
-		return 0, err
+		return res, err
 	}
-	if len(res.Programmes) == 0 {
-		return 0, fmt.Errorf("文件中没有可用节目（共 %d 条，其中时间无效或缺标题 %d 条，已过期或太远 %d 条），可能是文件已过期",
-			res.Total, res.BadTime, res.OutOfWindow)
+	if len(parsed.Programmes) == 0 {
+		return res, fmt.Errorf("文件中没有可用节目（共 %d 条，其中时间无效或缺标题 %d 条，已过期或太远 %d 条），可能是文件已过期",
+			parsed.Total, parsed.BadTime, parsed.OutOfWindow)
 	}
 
 	resolver, err := newChannelResolver(ctx, s.channelRepo)
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 
-	fileChannels := make(map[string]*xmltv.Channel, len(res.Channels))
-	for _, c := range res.Channels {
+	fileChannels := make(map[string]*xmltv.Channel, len(parsed.Channels))
+	for _, c := range parsed.Channels {
 		fileChannels[c.ID] = c
 	}
 
 	resolved := make(map[string]*model.Channel) // 文件里的频道 id -> 数据库频道
 	channels := make(map[string]*model.Channel) // 数据库频道 id -> 频道
 	grouped := make(map[string][]*xmltv.Programme)
-	for _, p := range res.Programmes {
+	for _, p := range parsed.Programmes {
 		ch, ok := resolved[p.ChannelID]
 		if !ok {
 			info := fileChannels[p.ChannelID]
@@ -338,7 +451,7 @@ func (s *CustomSourceService) importSource(ctx context.Context, src *model.Custo
 				info = &xmltv.Channel{ID: p.ChannelID}
 			}
 			if ch, err = resolver.resolve(ctx, info); err != nil {
-				return 0, err
+				return res, err
 			}
 			resolved[p.ChannelID] = ch
 		}
@@ -352,24 +465,47 @@ func (s *CustomSourceService) importSource(ctx context.Context, src *model.Custo
 	}
 	sort.Strings(ids)
 
-	total := 0
-	var failed []string
+	// 按频道时区把节目分到天，只留 dayWindow 内的
+	plans := make([]*channelPlan, 0, len(ids))
+	usable := 0
 	for _, id := range ids {
-		programs := buildPrograms(src, channels[id], grouped[id])
-		if err := s.programRepo.ReplaceChannelRanges(ctx, id, coveredRanges(programs), src.ProviderID(), win.From, programs); err != nil {
+		ch := channels[id]
+		loc, tz := channelLocation(ch)
+		from, to := dayWindow(now, loc)
+		plan := &channelPlan{channel: ch, loc: loc, tz: tz, from: from, to: to, byDay: map[string][]*model.Program{}}
+		for _, p := range buildPrograms(src, ch, grouped[id]) {
+			if p.StartTime.Before(from) || !p.StartTime.Before(to) {
+				continue
+			}
+			day := p.StartTime.In(loc).Format(dayLayout)
+			plan.byDay[day] = append(plan.byDay[day], p)
+			usable++
+		}
+		plans = append(plans, plan)
+	}
+	if usable == 0 {
+		return res, fmt.Errorf("文件中没有昨天到之后 %d 天内的节目，可能是文件已过期", customSourceDaysAfter)
+	}
+
+	var failed []string
+	for _, plan := range plans {
+		written, skipped, n, err := s.writeChannel(ctx, src, plan, blocked)
+		if err != nil {
 			logger.Error("Failed to write custom source programs",
-				logger.Err(err), logger.Int64("source_id", src.ID), logger.String("channel_id", id))
-			failed = append(failed, id)
+				logger.Err(err), logger.Int64("source_id", src.ID), logger.String("channel_id", plan.channel.ChannelID))
+			failed = append(failed, plan.channel.ChannelID)
 			continue
 		}
-		total += len(programs)
+		res.daysWritten += written
+		res.daysSkipped += skipped
+		res.programs += n
 	}
 
 	// 文件里已经没有的频道（或改了正则后对应到别的频道），上次写入的节目要清掉。
 	// 写入失败的频道也在 ids 里，保留它们上次的数据
 	stale, err := s.programRepo.DeleteByProviderOutsideChannels(ctx, src.ProviderID(), ids, win.From)
 	if err != nil {
-		return total, err
+		return res, err
 	}
 	if stale > 0 {
 		logger.Info("Removed programs of channels no longer in custom source",
@@ -381,9 +517,52 @@ func (s *CustomSourceService) importSource(ctx context.Context, src *model.Custo
 		if len(shown) > 5 {
 			shown = shown[:5]
 		}
-		return total, fmt.Errorf("%d 个频道写入失败：%s", len(failed), strings.Join(shown, "、"))
+		return res, fmt.Errorf("%d 个频道写入失败：%s", len(failed), strings.Join(shown, "、"))
 	}
-	return total, nil
+	return res, nil
+}
+
+// writeChannel 写入一个频道：被更优先的数据占用的天跳过，其余的天整天替换；
+// 本源在这个频道上不再写入的天，上次的旧数据一并清掉。返回写入的天数、跳过的天数和写入的节目数
+func (s *CustomSourceService) writeChannel(ctx context.Context, src *model.CustomSource, plan *channelPlan, blocked dayOwner) (int, int, int, error) {
+	id := plan.channel.ChannelID
+	existing, err := s.programRepo.ListProviderDays(ctx, id, plan.tz, plan.from, plan.to)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	taken := make(map[string]bool)
+	for _, e := range existing {
+		if e.ProviderID != src.ProviderID() && blocked(e.ProviderID) {
+			taken[e.Day] = true
+		}
+	}
+
+	days := make([]string, 0, len(plan.byDay))
+	for day := range plan.byDay {
+		days = append(days, day)
+	}
+	sort.Strings(days)
+
+	var ranges []model.TimeRange
+	var programs []*model.Program
+	skipped := 0
+	for _, day := range days {
+		if taken[day] {
+			skipped++
+			continue
+		}
+		start, err := time.ParseInLocation(dayLayout, day, plan.loc)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		ranges = append(ranges, model.TimeRange{From: start, To: start.AddDate(0, 0, 1)})
+		programs = append(programs, plan.byDay[day]...)
+	}
+
+	if err := s.programRepo.ReplaceChannelDays(ctx, id, ranges, src.ProviderID(), plan.from, programs); err != nil {
+		return 0, 0, 0, err
+	}
+	return len(ranges), skipped, len(programs), nil
 }
 
 // buildPrograms 把同一个频道的节目转成入库格式：按开始时间排序，开始时间相同的只留第一条
@@ -413,22 +592,6 @@ func buildPrograms(src *model.CustomSource, ch *model.Channel, in []*xmltv.Progr
 		})
 	}
 	return out
-}
-
-// coveredRanges 把按开始时间排好序的节目合并成连续的时间段：首尾相接或重叠的并成一段，
-// 中间有空档的分成两段。只有这些时间段里的原有节目会被覆盖，空档里的保留
-func coveredRanges(programs []*model.Program) []model.TimeRange {
-	var ranges []model.TimeRange
-	for _, p := range programs {
-		if n := len(ranges); n > 0 && !p.StartTime.After(ranges[n-1].To) {
-			if p.EndTime.After(ranges[n-1].To) {
-				ranges[n-1].To = p.EndTime
-			}
-			continue
-		}
-		ranges = append(ranges, model.TimeRange{From: p.StartTime, To: p.EndTime})
-	}
-	return ranges
 }
 
 // 名字末尾的清晰度标记（含前面的空格、横线）。不含 4K：4K 频道通常是独立的节目单

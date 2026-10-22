@@ -62,15 +62,17 @@ type fileServer struct {
 	*httptest.Server
 	mu    sync.Mutex
 	files map[string]string
+	hits  map[string]int
 	gate  chan struct{} // 非 nil 时，请求会阻塞到它被关闭
 }
 
 func newFileServer(t *testing.T) *fileServer {
 	t.Helper()
-	fs := &fileServer{files: map[string]string{}}
+	fs := &fileServer{files: map[string]string{}, hits: map[string]int{}}
 	fs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fs.mu.Lock()
 		content, ok := fs.files[r.URL.Path]
+		fs.hits[r.URL.Path]++
 		gate := fs.gate
 		fs.mu.Unlock()
 		if gate != nil {
@@ -100,6 +102,13 @@ func (fs *fileServer) set(path, content string) {
 	fs.files[path] = content
 }
 
+// hitCount 返回 path 被请求的次数
+func (fs *fileServer) hitCount(path string) int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.hits[path]
+}
+
 func (fs *fileServer) remove(path string) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -115,7 +124,7 @@ type customEnv struct {
 	channels repository.ChannelRepository
 	cache    cache.Cache
 	files    *fileServer
-	base     time.Time // 今天 00:00
+	base     time.Time // 频道时区（东八区）今天 00:00，与机器时区无关
 }
 
 func newCustomEnv(t *testing.T) *customEnv {
@@ -129,16 +138,29 @@ func newCustomEnv(t *testing.T) *customEnv {
 		files:    newFileServer(t),
 	}
 	e.svc = NewCustomSourceService(e.repo, e.channels, e.programs, e.cache)
-	now := time.Now()
-	e.base = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	loc, err := time.LoadLocation(defaultChannelTimezone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().In(loc)
+	e.base = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	return e
 }
 
+// h 返回今天 00:00 之后第 n 个小时；n >= 24 落在明天
 func (e *customEnv) h(n int) time.Time { return e.base.Add(time.Duration(n) * time.Hour) }
 
 func (e *customEnv) addSource(t *testing.T, path string, priority, enabled int) *model.CustomSource {
+	return e.add(t, path, model.CustomSourceModeFull, priority, enabled)
+}
+
+func (e *customEnv) addFill(t *testing.T, path string, priority int) *model.CustomSource {
+	return e.add(t, path, model.CustomSourceModeFill, priority, 1)
+}
+
+func (e *customEnv) add(t *testing.T, path, mode string, priority, enabled int) *model.CustomSource {
 	t.Helper()
-	src := &model.CustomSource{Name: "src" + path, URL: e.files.URL + path, Enabled: enabled, Priority: priority}
+	src := &model.CustomSource{Name: "src" + path, URL: e.files.URL + path, Mode: mode, Enabled: enabled, Priority: priority}
 	if err := e.repo.Create(context.Background(), src); err != nil {
 		t.Fatal(err)
 	}
@@ -148,11 +170,17 @@ func (e *customEnv) addSource(t *testing.T, path string, priority, enabled int) 
 // seedBuiltin 给频道写入今天 24 个整点节目 b0..b23，模拟内置 provider 的数据
 func (e *customEnv) seedBuiltin(t *testing.T, channelID string) {
 	t.Helper()
+	e.seedBuiltinDay(t, channelID, 0, "b")
+}
+
+// seedBuiltinDay 给频道写入今天之后第 offset 天的 24 个整点节目，标题为 prefix+小时
+func (e *customEnv) seedBuiltinDay(t *testing.T, channelID string, offset int, prefix string) {
+	t.Helper()
 	var programs []*model.Program
 	for i := range 24 {
 		programs = append(programs, &model.Program{
-			ChannelID: channelID, Title: fmt.Sprintf("b%d", i), ProviderID: "cctv_cn",
-			StartTime: e.h(i), EndTime: e.h(i + 1),
+			ChannelID: channelID, Title: fmt.Sprintf("%s%d", prefix, i), ProviderID: "cctv_cn",
+			StartTime: e.h(offset*24 + i), EndTime: e.h(offset*24 + i + 1),
 		})
 	}
 	if err := e.programs.CreateBatch(context.Background(), programs); err != nil {
@@ -163,7 +191,19 @@ func (e *customEnv) seedBuiltin(t *testing.T, channelID string) {
 // listed 返回频道所有节目，格式 "provider:title"，按开始时间排序
 func (e *customEnv) listed(t *testing.T, channelID string) []string {
 	t.Helper()
-	ps, err := e.programs.ListByChannelIDAndTimeRange(context.Background(), channelID, e.base.AddDate(0, 0, -30), e.base.AddDate(0, 0, 30))
+	return e.listedBetween(t, channelID, e.base.AddDate(0, 0, -30), e.base.AddDate(0, 0, 30))
+}
+
+// listedDay 返回频道今天之后第 offset 天的节目
+func (e *customEnv) listedDay(t *testing.T, channelID string, offset int) []string {
+	t.Helper()
+	day := e.base.AddDate(0, 0, offset)
+	return e.listedBetween(t, channelID, day, day.AddDate(0, 0, 1))
+}
+
+func (e *customEnv) listedBetween(t *testing.T, channelID string, from, to time.Time) []string {
+	t.Helper()
+	ps, err := e.programs.ListByChannelIDAndTimeRange(context.Background(), channelID, from, to)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,24 +238,59 @@ func waitStatus(t *testing.T, e *customEnv, id int64, want string) *model.Custom
 	}
 }
 
-// ---- 测试 ----
+// waitPrograms 等频道的节目变成 want（后台同步是异步的）
+func waitPrograms(t *testing.T, e *customEnv, channelID string, want ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := e.listed(t, channelID)
+		if strings.Join(got, ",") == strings.Join(want, ",") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s = %q, want %q", channelID, got, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
 
-func TestCustomSourceOverridesBuiltinAndCreatesChannels(t *testing.T) {
+// hourly 生成某个频道从第 from 小时到第 to 小时的整点节目，标题为 prefix+小时
+func hourly(channel, prefix string, e *customEnv, from, to int) []tvProg {
+	var out []tvProg
+	for i := from; i < to; i++ {
+		out = append(out, tvProg{channel, fmt.Sprintf("%s%d", prefix, i), e.h(i), e.h(i + 1)})
+	}
+	return out
+}
+
+func titles(provider, prefix string, from, to int) []string {
+	var out []string
+	for i := from; i < to; i++ {
+		out = append(out, fmt.Sprintf("%s:%s%d", provider, prefix, i))
+	}
+	return out
+}
+
+// ---- 全量覆盖 ----
+
+// 全量源按「频道+天」整天覆盖：当天只要有文件里的节目，内置节目整天被换掉（包括文件没覆盖的时段）；
+// 文件没有的天保持不变
+func TestCustomSourceFullReplacesWholeDayAndCreatesChannels(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
 	e.seedBuiltin(t, "CCTV1")
+	e.seedBuiltinDay(t, "CCTV1", 1, "t")
 	e.seedBuiltin(t, "CCTV2")
 
 	before, err := e.channels.GetByID(ctx, "CCTV1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var channelCount int64
-	if all, err := e.channels.GetAllChannels(ctx); err != nil {
+	all, err := e.channels.GetAllChannels(ctx)
+	if err != nil {
 		t.Fatal(err)
-	} else {
-		channelCount = int64(len(all))
 	}
+	channelCount := len(all)
 
 	e.files.set("/epg.xml.gz", buildXMLTV(
 		[]tvChannel{
@@ -224,12 +299,12 @@ func TestCustomSourceOverridesBuiltinAndCreatesChannels(t *testing.T) {
 			{id: "2002", names: []string{"广东本地台高清"}, icon: "http://logo.test/gd.png"}, // 内置没有，新建
 		},
 		[]tvProg{
-			{"1001", "c8", e.h(8), e.h(9)}, {"1001", "c9", e.h(9), e.h(10)}, {"1001", "c10", e.h(10), e.h(11)},
+			{"1001", "c8", e.h(8), e.h(9)}, {"1001", "c9", e.h(9), e.h(10)}, {"1001", "c20", e.h(20), e.h(21)},
 			{"CCTV2", "x8", e.h(8), e.h(9)},
 			{"2002", "l8", e.h(8), e.h(9)}, {"2002", "l9", e.h(9), e.h(10)},
 		},
 	))
-	src := e.addSource(t, "/epg.xml.gz", 10, 1)
+	src := e.addSource(t, "/epg.xml.gz", 0, 1)
 	pid := src.ProviderID()
 
 	// 缓存的 XMLTV 输出要在同步后失效
@@ -237,21 +312,10 @@ func TestCustomSourceOverridesBuiltinAndCreatesChannels(t *testing.T) {
 
 	e.svc.SyncAll(ctx)
 
-	// 文件覆盖 08:00-11:00，之外的内置节目原样保留
-	want := []string{}
-	for i := 0; i < 8; i++ {
-		want = append(want, fmt.Sprintf("cctv_cn:b%d", i))
-	}
-	want = append(want, pid+":c8", pid+":c9", pid+":c10")
-	for i := 11; i < 24; i++ {
-		want = append(want, fmt.Sprintf("cctv_cn:b%d", i))
-	}
-	assertPrograms(t, e.listed(t, "CCTV1"), want...)
-
-	got2 := e.listed(t, "CCTV2")
-	if len(got2) != 24 || got2[8] != pid+":x8" {
-		t.Errorf("CCTV2 = %q", got2)
-	}
+	// 今天整天以文件为准，节目之间的空档也不保留内置节目；明天文件里没有，内置节目不动
+	assertPrograms(t, e.listedDay(t, "CCTV1", 0), pid+":c8", pid+":c9", pid+":c20")
+	assertPrograms(t, e.listedDay(t, "CCTV1", 1), titles("cctv_cn", "t", 0, 24)...)
+	assertPrograms(t, e.listedDay(t, "CCTV2", 0), pid+":x8")
 
 	// 新建的频道：名称去掉清晰度后缀，带台标，且按名称（含 HD 写法）能被 DIYP 的正则查到
 	local, err := e.channels.GetByID(ctx, "广东本地台")
@@ -273,12 +337,13 @@ func TestCustomSourceOverridesBuiltinAndCreatesChannels(t *testing.T) {
 	if after.DisplayName != before.DisplayName || after.Regexp != before.Regexp || after.LogoURL != before.LogoURL {
 		t.Errorf("built-in channel modified: before=%+v after=%+v", before, after)
 	}
-	if all, _ := e.channels.GetAllChannels(ctx); int64(len(all)) != channelCount+1 {
+	if all, _ := e.channels.GetAllChannels(ctx); len(all) != channelCount+1 {
 		t.Errorf("channels = %d, want %d", len(all), channelCount+1)
 	}
 
 	got := e.source(t, src.ID)
-	if got.LastStatus != model.CustomSourceStatusSuccess || got.LastError != "" || got.ProgramCount != 6 || got.LastSyncAt == nil {
+	if got.LastStatus != model.CustomSourceStatusSuccess || got.LastError != "" || got.LastMessage != "" ||
+		got.ProgramCount != 6 || got.LastSyncAt == nil {
 		t.Errorf("source state = %+v", got)
 	}
 	if ok, _ := e.cache.Exists(ctx, xmltvCacheKey(time.Now())); ok {
@@ -291,17 +356,19 @@ func TestCustomSourceResyncIsIdempotentAndDropsStale(t *testing.T) {
 	ctx := context.Background()
 	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
 
+	// 今天三个节目，明天一个
 	e.files.set("/epg.xml", buildXMLTV(ch, []tvProg{
 		{"1", "a", e.h(8), e.h(9)}, {"1", "b", e.h(9), e.h(10)}, {"1", "c", e.h(10), e.h(11)},
+		{"1", "tomorrow", e.h(32), e.h(33)},
 	}))
-	src := e.addSource(t, "/epg.xml", 10, 1)
+	src := e.addSource(t, "/epg.xml", 0, 1)
 	pid := src.ProviderID()
 
 	e.svc.SyncAll(ctx)
 	e.svc.SyncAll(ctx)
-	assertPrograms(t, e.listed(t, "本地台"), pid+":a", pid+":b", pid+":c")
+	assertPrograms(t, e.listed(t, "本地台"), pid+":a", pid+":b", pid+":c", pid+":tomorrow")
 
-	// 文件内容变短：上次写入、这次文件里没有的节目不能残留
+	// 文件内容变短，且不再有明天：上次写入、这次文件里没有的节目和天都不能残留
 	e.files.set("/epg.xml", buildXMLTV(ch, []tvProg{
 		{"1", "b2", e.h(9), e.h(10)}, {"1", "c", e.h(10), e.h(11)},
 	}))
@@ -330,44 +397,53 @@ func TestCustomSourceExpiredOrBrokenFileKeepsExistingData(t *testing.T) {
 		"/missing.xml": "404",
 	}
 	for path, wantErr := range cases {
-		src := e.addSource(t, path, 10, 1)
-		src.ProgramCount = 7 // 失败时应保留上次的节目数
+		src := e.addSource(t, path, 0, 1)
 		e.svc.SyncAll(ctx)
 
 		got := e.source(t, src.ID)
 		if got.LastStatus != model.CustomSourceStatusFailed || !strings.Contains(got.LastError, wantErr) {
 			t.Errorf("%s: status=%q error=%q, want failed containing %q", path, got.LastStatus, got.LastError, wantErr)
 		}
+		if err := e.repo.Delete(ctx, src.ID); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if got := e.listed(t, "CCTV1"); len(got) != 24 || got[0] != "cctv_cn:b0" {
-		t.Errorf("existing programs changed: %d programs", len(got))
-	}
+	assertPrograms(t, e.listed(t, "CCTV1"), titles("cctv_cn", "b", 0, 24)...)
 }
 
-func TestCustomSourcePriority(t *testing.T) {
-	// 不论创建顺序（id 大小）如何，priority 数字小的最终胜出
-	for _, highFirst := range []bool{true, false} {
-		t.Run(fmt.Sprintf("highFirst=%v", highFirst), func(t *testing.T) {
-			e := newCustomEnv(t)
-			ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
-			e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
-			e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(9), e.h(11)}}))
+// 多个全量源争同一个「频道+天」：先添加的优先，不论谁的数据多；后添加的只写别人没占的天
+func TestCustomSourceFullOlderWins(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+	e.files.set("/old.xml", buildXMLTV(ch, []tvProg{{"1", "O", e.h(8), e.h(9)}}))
+	e.files.set("/new.xml", buildXMLTV(ch, append(hourly("1", "n", e, 0, 24), tvProg{"1", "N-tomorrow", e.h(30), e.h(31)})))
+	older := e.addSource(t, "/old.xml", 0, 1)
+	newer := e.addSource(t, "/new.xml", 0, 1)
 
-			var high *model.CustomSource
-			if highFirst {
-				high = e.addSource(t, "/high.xml", 1, 1)
-				e.addSource(t, "/low.xml", 5, 1)
-			} else {
-				e.addSource(t, "/low.xml", 5, 1)
-				high = e.addSource(t, "/high.xml", 1, 1)
-			}
-
-			e.svc.SyncAll(context.Background())
-			// 先写 low 的 09-11，再写 high 的 08-10；low 的节目与之重叠，被整个覆盖掉
-			assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
-		})
+	e.svc.SyncAll(ctx)
+	assertPrograms(t, e.listedDay(t, "本地台", 0), older.ProviderID()+":O")
+	assertPrograms(t, e.listedDay(t, "本地台", 1), newer.ProviderID()+":N-tomorrow")
+	got := e.source(t, newer.ID)
+	if got.LastStatus != model.CustomSourceStatusSuccess || !strings.Contains(got.LastMessage, "1 个频道日已被先添加的全量源占用") {
+		t.Errorf("newer state = %+v", got)
 	}
+
+	// 先添加的源这次下载失败：它上次的数据保留，后添加的源仍然不能占用那一天
+	e.files.remove("/old.xml")
+	e.svc.SyncAll(ctx)
+	assertPrograms(t, e.listedDay(t, "本地台", 0), older.ProviderID()+":O")
+	if got := e.source(t, older.ID); got.LastStatus != model.CustomSourceStatusFailed || got.ProgramCount != 1 {
+		t.Errorf("older state = %+v", got)
+	}
+
+	// 先添加的源被删除后，后添加的源接管这一天
+	if err := e.svc.Delete(ctx, older.ID); err != nil {
+		t.Fatal(err)
+	}
+	want := append(titles(newer.ProviderID(), "n", 0, 24), newer.ProviderID()+":N-tomorrow")
+	waitPrograms(t, e, "本地台", want...)
 }
 
 func TestCustomSourceDisabledIsIgnored(t *testing.T) {
@@ -376,7 +452,7 @@ func TestCustomSourceDisabledIsIgnored(t *testing.T) {
 		[]tvChannel{{id: "1", names: []string{"本地台"}}},
 		[]tvProg{{"1", "a", e.h(8), e.h(9)}},
 	))
-	src := e.addSource(t, "/epg.xml", 10, 0)
+	src := e.addSource(t, "/epg.xml", 0, 0)
 
 	e.svc.SyncAll(context.Background())
 
@@ -388,16 +464,21 @@ func TestCustomSourceDisabledIsIgnored(t *testing.T) {
 	}
 }
 
-func TestCustomSourceDeletePurgesItsPrograms(t *testing.T) {
+// 删除全量源：清除它的节目，并触发补抓内置节目
+func TestCustomSourceDeleteFullPurgesAndRefills(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
+	refilled := make(chan []string, 1)
+	e.svc.SetRefill(func(channels []string) { refilled <- channels })
+
 	e.seedBuiltin(t, "CCTV1")
 	e.files.set("/epg.xml", buildXMLTV(
 		[]tvChannel{{id: "1", names: []string{"CCTV-1"}}, {id: "2", names: []string{"本地台"}}},
 		[]tvProg{{"1", "c", e.h(8), e.h(9)}, {"2", "l", e.h(8), e.h(9)}},
 	))
-	src := e.addSource(t, "/epg.xml", 10, 1)
+	src := e.addSource(t, "/epg.xml", 0, 1)
 	e.svc.SyncAll(ctx)
+	assertPrograms(t, e.listed(t, "CCTV1"), src.ProviderID()+":c")
 
 	if err := e.svc.Delete(ctx, src.ID); err != nil {
 		t.Fatal(err)
@@ -405,16 +486,15 @@ func TestCustomSourceDeletePurgesItsPrograms(t *testing.T) {
 	if _, err := e.repo.GetByID(ctx, src.ID); !errors.Is(err, errors.ErrCodeNotFound) {
 		t.Errorf("source still exists: %v", err)
 	}
-	for _, id := range []string{"CCTV1", "本地台"} {
-		for _, p := range e.listed(t, id) {
-			if strings.HasPrefix(p, model.CustomSourceProviderPrefix) {
-				t.Errorf("%s still has %s", id, p)
-			}
-		}
-	}
-	// 其它 provider 的节目不受影响
-	if got := e.listed(t, "CCTV1"); len(got) != 23 {
-		t.Errorf("CCTV1 has %d programs, want 23 (24 built-in minus the one covered by the deleted source)", len(got))
+	// 全量源占过的那天已经没有数据，要等补抓
+	assertPrograms(t, e.listed(t, "CCTV1"))
+	assertPrograms(t, e.listed(t, "本地台"))
+	// 只补抓它占用过的频道
+	select {
+	case channels := <-refilled:
+		assertPrograms(t, channels, "CCTV1", "本地台")
+	case <-time.After(time.Second):
+		t.Fatal("refill was not triggered after deleting a full source")
 	}
 }
 
@@ -426,7 +506,7 @@ func TestCustomSourceStartSyncIsExclusiveAndAsync(t *testing.T) {
 		[]tvProg{{"1", "a", e.h(8), e.h(9)}},
 	))
 	e.files.gate = make(chan struct{})
-	src := e.addSource(t, "/epg.xml", 10, 1)
+	src := e.addSource(t, "/epg.xml", 0, 1)
 
 	if err := e.svc.StartSync(ctx, src.ID); err != nil {
 		t.Fatal(err)
@@ -463,7 +543,7 @@ func TestCustomSourceCreateAndUpdateTriggerSync(t *testing.T) {
 		[]tvProg{{"1", "b", e.h(8), e.h(9)}},
 	))
 
-	src, err := e.svc.Create(ctx, &model.CustomSource{Name: " 电信 ", URL: e.files.URL + "/a.xml", Enabled: 1, Priority: 10})
+	src, err := e.svc.Create(ctx, &model.CustomSource{Name: " 电信 ", URL: e.files.URL + "/a.xml", Mode: model.CustomSourceModeFull, Enabled: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,32 +554,25 @@ func TestCustomSourceCreateAndUpdateTriggerSync(t *testing.T) {
 	assertPrograms(t, e.listed(t, "本地台"), src.ProviderID()+":a")
 
 	// 改了地址会重新同步
-	updated, err := e.svc.Update(ctx, &model.CustomSource{ID: src.ID, Name: "电信", URL: e.files.URL + "/b.xml", Enabled: 1, Priority: 10})
+	updated, err := e.svc.Update(ctx, &model.CustomSource{ID: src.ID, Name: "电信", URL: e.files.URL + "/b.xml", Mode: model.CustomSourceModeFull, Enabled: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		got := e.listed(t, "本地台")
-		if len(got) == 1 && got[0] == updated.ProviderID()+":b" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("not re-synced after url change: %q", got)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitPrograms(t, e, "本地台", updated.ProviderID()+":b")
 }
 
 func TestCustomSourceValidation(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
+	full := model.CustomSourceModeFull
 	for _, src := range []*model.CustomSource{
-		{Name: "", URL: "http://example.com/a.xml"},
-		{Name: "x", URL: ""},
-		{Name: "x", URL: "ftp://example.com/a.xml"},
-		{Name: "x", URL: "file:///etc/passwd"},
-		{Name: "x", URL: "example.com/a.xml"},
+		{Name: "", URL: "http://example.com/a.xml", Mode: full},
+		{Name: "x", URL: "", Mode: full},
+		{Name: "x", URL: "ftp://example.com/a.xml", Mode: full},
+		{Name: "x", URL: "file:///etc/passwd", Mode: full},
+		{Name: "x", URL: "example.com/a.xml", Mode: full},
+		{Name: "x", URL: "http://example.com/a.xml", Mode: "replace"},
+		{Name: "x", URL: "http://example.com/a.xml"},
 	} {
 		if _, err := e.svc.Create(ctx, src); !errors.Is(err, errors.ErrCodeInvalidParam) {
 			t.Errorf("Create(%+v) err = %v, want invalid param", src, err)
@@ -510,7 +583,7 @@ func TestCustomSourceValidation(t *testing.T) {
 func TestResetStale(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
-	src := e.addSource(t, "/epg.xml", 10, 1)
+	src := e.addSource(t, "/epg.xml", 0, 1)
 	if err := e.repo.SetRunning(ctx, src.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -541,130 +614,46 @@ func TestNormalizeChannelName(t *testing.T) {
 	}
 }
 
-// 问题 2：同一频道的节目中间有空档时，空档里的内置节目必须保留
-func TestCustomSourceKeepsBuiltinInGaps(t *testing.T) {
-	e := newCustomEnv(t)
-	e.seedBuiltin(t, "CCTV1")
-	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
-		[]tvProg{{"1", "c8", e.h(8), e.h(9)}, {"1", "c9", e.h(9), e.h(10)}, {"1", "c20", e.h(20), e.h(21)}}))
-	src := e.addSource(t, "/a.xml", 10, 1)
-	pid := src.ProviderID()
-
-	e.svc.SyncAll(context.Background())
-
-	var want []string
-	for i := range 24 {
-		switch i {
-		case 8:
-			want = append(want, pid+":c8")
-		case 9:
-			want = append(want, pid+":c9")
-		case 20:
-			want = append(want, pid+":c20")
-		default:
-			want = append(want, fmt.Sprintf("cctv_cn:b%d", i))
-		}
-	}
-	assertPrograms(t, e.listed(t, "CCTV1"), want...)
-}
-
-// 问题 3：「立即同步」优先级低的源，不能盖掉优先级高的源
-func TestCustomSourceManualSyncKeepsPriority(t *testing.T) {
-	e := newCustomEnv(t)
-	ctx := context.Background()
-	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
-	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
-	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))
-	high := e.addSource(t, "/high.xml", 1, 1)
-	low := e.addSource(t, "/low.xml", 5, 1)
-
-	if err := e.svc.StartSync(ctx, low.ID); err != nil {
-		t.Fatal(err)
-	}
-	// 两个源都被标记为同步中，并且都同步完成
-	if got := e.source(t, high.ID); got.LastStatus != model.CustomSourceStatusRunning &&
-		got.LastStatus != model.CustomSourceStatusSuccess {
-		t.Errorf("high status = %q, want running or success", got.LastStatus)
-	}
-	waitStatus(t, e, low.ID, model.CustomSourceStatusSuccess)
-	waitStatus(t, e, high.ID, model.CustomSourceStatusSuccess)
-	assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
-}
-
 func TestCustomSourceStartSyncRejectsDisabled(t *testing.T) {
 	e := newCustomEnv(t)
-	src := e.addSource(t, "/a.xml", 10, 0)
+	src := e.addSource(t, "/a.xml", 0, 0)
 	if err := e.svc.StartSync(context.Background(), src.ID); !errors.Is(err, errors.ErrCodeInvalidParam) {
 		t.Errorf("StartSync on disabled source err = %v, want invalid param", err)
 	}
 }
 
-// waitPrograms 等频道的节目变成 want（后台同步是异步的）
-func waitPrograms(t *testing.T, e *customEnv, channelID string, want ...string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		got := e.listed(t, channelID)
-		if strings.Join(got, ",") == strings.Join(want, ",") {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s = %q, want %q", channelID, got, want)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// 问题 4：停用后清除它写入的节目，被它覆盖的低优先级源的数据重新同步回来
-func TestCustomSourceDisablePurgesAndRestoresLower(t *testing.T) {
+// 只有一个全量源时停用：节目被清除，并触发补抓内置节目
+func TestCustomSourceDisableFullPurgesAndRefills(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
-	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
-	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
-	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))
-	high := e.addSource(t, "/high.xml", 1, 1)
-	low := e.addSource(t, "/low.xml", 5, 1)
-	e.svc.SyncAll(ctx)
-	assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
+	refilled := make(chan []string, 1)
+	e.svc.SetRefill(func(channels []string) { refilled <- channels })
 
-	high.Enabled = 0
-	updated, err := e.svc.Update(ctx, high)
+	e.seedBuiltin(t, "CCTV1")
+	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
+		[]tvProg{{"1", "c8", e.h(8), e.h(9)}}))
+	src := e.addSource(t, "/a.xml", 0, 1)
+	e.svc.SyncAll(ctx)
+
+	src.Enabled = 0
+	updated, err := e.svc.Update(ctx, src)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if updated.Enabled != 0 || updated.LastStatus != "" || updated.ProgramCount != 0 {
 		t.Errorf("disabled source state = %+v, want enabled=0, status empty, program_count 0", updated)
 	}
-	waitPrograms(t, e, "本地台", low.ProviderID()+":L")
-	waitStatus(t, e, low.ID, model.CustomSourceStatusSuccess)
+	assertPrograms(t, e.listed(t, "CCTV1"))
+	select {
+	case channels := <-refilled:
+		assertPrograms(t, channels, "CCTV1")
+	case <-time.After(time.Second):
+		t.Fatal("refill was not triggered after disabling a full source")
+	}
 
-	// 之后的定时同步也不会再写入停用的源
+	// 之后的同步也不会再写入停用的源
 	e.svc.SyncAll(ctx)
-	assertPrograms(t, e.listed(t, "本地台"), low.ProviderID()+":L")
-}
-
-// 只有一个源时停用：节目被清除，频道恢复成内置数据（被删的时段要等内置源下次同步补回）
-func TestCustomSourceDisableOnlySource(t *testing.T) {
-	e := newCustomEnv(t)
-	ctx := context.Background()
-	e.seedBuiltin(t, "CCTV1")
-	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
-		[]tvProg{{"1", "c8", e.h(8), e.h(9)}}))
-	src := e.addSource(t, "/a.xml", 10, 1)
-	e.svc.SyncAll(ctx)
-
-	src.Enabled = 0
-	if _, err := e.svc.Update(ctx, src); err != nil {
-		t.Fatal(err)
-	}
-	for _, p := range e.listed(t, "CCTV1") {
-		if strings.HasPrefix(p, model.CustomSourceProviderPrefix) {
-			t.Fatalf("disabled source still has %s", p)
-		}
-	}
-	if got := len(e.listed(t, "CCTV1")); got != 23 {
-		t.Errorf("CCTV1 has %d programs, want 23", got)
-	}
+	assertPrograms(t, e.listed(t, "CCTV1"))
 }
 
 func TestCustomSourceDisableDuringSyncConflicts(t *testing.T) {
@@ -673,7 +662,7 @@ func TestCustomSourceDisableDuringSyncConflicts(t *testing.T) {
 	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"本地台"}}},
 		[]tvProg{{"1", "a", e.h(8), e.h(9)}}))
 	e.files.gate = make(chan struct{})
-	src := e.addSource(t, "/a.xml", 10, 1)
+	src := e.addSource(t, "/a.xml", 0, 1)
 	if err := e.svc.StartSync(ctx, src.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -689,7 +678,7 @@ func TestCustomSourceDisableDuringSyncConflicts(t *testing.T) {
 	waitStatus(t, e, src.ID, model.CustomSourceStatusSuccess)
 }
 
-// 问题 5：文件里去掉的频道，上次写入的节目要清掉；其它源的节目不受影响
+// 文件里去掉的频道，上次写入的节目要清掉，空出来的天可以被增量源补上
 func TestCustomSourceRemovedChannelIsCleaned(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
@@ -699,10 +688,10 @@ func TestCustomSourceRemovedChannelIsCleaned(t *testing.T) {
 	e.files.set("/other.xml", buildXMLTV(
 		[]tvChannel{{id: "x", names: []string{"台B"}}},
 		[]tvProg{{"x", "other", e.h(12), e.h(13)}}))
-	src := e.addSource(t, "/a.xml", 10, 1)
-	other := e.addSource(t, "/other.xml", 20, 1)
+	src := e.addSource(t, "/a.xml", 0, 1)
+	other := e.addFill(t, "/other.xml", 10)
 	e.svc.SyncAll(ctx)
-	assertPrograms(t, e.listed(t, "台B"), src.ProviderID()+":b", other.ProviderID()+":other")
+	assertPrograms(t, e.listed(t, "台B"), src.ProviderID()+":b")
 
 	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"台A"}}},
 		[]tvProg{{"1", "a", e.h(8), e.h(9)}}))
@@ -712,7 +701,7 @@ func TestCustomSourceRemovedChannelIsCleaned(t *testing.T) {
 	assertPrograms(t, e.listed(t, "台B"), other.ProviderID()+":other")
 }
 
-// 问题 6：宽松的前缀正则不能把不同的频道合并进来，但真正同一频道的各种写法仍要认出来
+// 宽松的前缀正则不能把不同的频道合并进来，但真正同一频道的各种写法仍要认出来
 func TestCustomSourceChannelMatching(t *testing.T) {
 	e := newCustomEnv(t)
 	ctx := context.Background()
@@ -738,7 +727,7 @@ func TestCustomSourceChannelMatching(t *testing.T) {
 		progs = append(progs, tvProg{id, c.name, e.h(i), e.h(i + 1)})
 	}
 	e.files.set("/a.xml", buildXMLTV(channels, progs))
-	src := e.addSource(t, "/a.xml", 10, 1)
+	src := e.addSource(t, "/a.xml", 0, 1)
 	e.svc.SyncAll(ctx)
 
 	if got := e.source(t, src.ID); got.LastStatus != model.CustomSourceStatusSuccess {
@@ -787,22 +776,181 @@ func TestRegexpRemainderOK(t *testing.T) {
 	}
 }
 
-func TestCoveredRanges(t *testing.T) {
-	base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := func(n int) time.Time { return base.Add(time.Duration(n) * time.Hour) }
-	p := func(from, to int) *model.Program { return &model.Program{StartTime: h(from), EndTime: h(to)} }
+// ---- 增量补充 ----
 
-	got := coveredRanges([]*model.Program{p(1, 2), p(2, 3), p(3, 5), p(4, 6), p(8, 9), p(9, 10), p(12, 13)})
-	want := []model.TimeRange{{From: h(1), To: h(6)}, {From: h(8), To: h(10)}, {From: h(12), To: h(13)}}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
+// 增量源只补内置源当天没有节目的「频道+天」
+func TestCustomSourceFillOnlyFillsMissingDays(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	e.seedBuiltin(t, "CCTV1")
+	e.files.set("/fill.xml", buildXMLTV(
+		[]tvChannel{{id: "1", names: []string{"CCTV-1"}}, {id: "2", names: []string{"本地台"}}},
+		[]tvProg{
+			{"1", "f-today", e.h(8), e.h(9)},      // 内置今天有 -> 不补
+			{"1", "f-tomorrow", e.h(32), e.h(33)}, // 内置明天没有 -> 补
+			{"2", "l", e.h(8), e.h(9)},            // 内置没有这个频道 -> 补
+		}))
+	src := e.addFill(t, "/fill.xml", 10)
+	pid := src.ProviderID()
+	if !strings.HasPrefix(pid, model.CustomSourceFillProviderPrefix) {
+		t.Fatalf("fill provider id = %q", pid)
 	}
-	for i := range want {
-		if !got[i].From.Equal(want[i].From) || !got[i].To.Equal(want[i].To) {
-			t.Fatalf("got %v, want %v", got, want)
-		}
+
+	e.svc.SyncAll(ctx)
+
+	assertPrograms(t, e.listedDay(t, "CCTV1", 0), titles("cctv_cn", "b", 0, 24)...)
+	assertPrograms(t, e.listedDay(t, "CCTV1", 1), pid+":f-tomorrow")
+	assertPrograms(t, e.listed(t, "本地台"), pid+":l")
+	got := e.source(t, src.ID)
+	if got.LastStatus != model.CustomSourceStatusSuccess || got.ProgramCount != 2 ||
+		got.LastMessage != "补充了 2 个频道日，1 个频道日已有节目" {
+		t.Errorf("source state = %+v", got)
 	}
-	if got := coveredRanges(nil); len(got) != 0 {
-		t.Errorf("empty input: %v", got)
+}
+
+// 增量源不会覆盖全量源，不论优先级多高
+func TestCustomSourceFillNeverOverridesFull(t *testing.T) {
+	e := newCustomEnv(t)
+	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+	e.files.set("/full.xml", buildXMLTV(ch, []tvProg{{"1", "F", e.h(8), e.h(9)}}))
+	e.files.set("/fill.xml", buildXMLTV(ch, []tvProg{{"1", "f", e.h(10), e.h(11)}}))
+	fill := e.addFill(t, "/fill.xml", 0) // 先添加、优先级最高
+	full := e.addSource(t, "/full.xml", 0, 1)
+
+	e.svc.SyncAll(context.Background())
+	e.svc.SyncAll(context.Background())
+
+	assertPrograms(t, e.listed(t, "本地台"), full.ProviderID()+":F")
+	if got := e.source(t, fill.ID); got.ProgramCount != 0 {
+		t.Errorf("fill source wrote %d programs", got.ProgramCount)
+	}
+}
+
+// 增量源之间按优先级：数字小的先补，不论添加顺序；低优先级的只补剩下的天
+func TestCustomSourceFillPriority(t *testing.T) {
+	for _, highFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("highFirst=%v", highFirst), func(t *testing.T) {
+			e := newCustomEnv(t)
+			ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+			e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
+			e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}, {"1", "L-tomorrow", e.h(32), e.h(33)}}))
+
+			var high, low *model.CustomSource
+			if highFirst {
+				high = e.addFill(t, "/high.xml", 1)
+				low = e.addFill(t, "/low.xml", 5)
+			} else {
+				low = e.addFill(t, "/low.xml", 5)
+				high = e.addFill(t, "/high.xml", 1)
+			}
+
+			e.svc.SyncAll(context.Background())
+			assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H", low.ProviderID()+":L-tomorrow")
+		})
+	}
+}
+
+// 高优先级增量源某次下载失败：它上次补的天保留，低优先级的不会趁机占用
+func TestCustomSourceFillHigherFailureKeepsItsDays(t *testing.T) {
+	e := newCustomEnv(t)
+	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
+	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))
+	high := e.addFill(t, "/high.xml", 1)
+	e.addFill(t, "/low.xml", 5)
+	e.svc.SyncAll(context.Background())
+
+	e.files.remove("/high.xml")
+	e.svc.SyncAll(context.Background())
+
+	assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
+}
+
+// 「立即同步」优先级低的增量源，不能让它盖掉优先级高的
+func TestCustomSourceManualSyncKeepsPriority(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
+	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))
+	high := e.addFill(t, "/high.xml", 1)
+	low := e.addFill(t, "/low.xml", 5)
+
+	if err := e.svc.StartSync(ctx, low.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, e, low.ID, model.CustomSourceStatusSuccess)
+	waitStatus(t, e, high.ID, model.CustomSourceStatusSuccess)
+	assertPrograms(t, e.listed(t, "本地台"), high.ProviderID()+":H")
+}
+
+// 停用增量源：清除它补的节目，低优先级增量源接手；不需要补抓内置节目
+func TestCustomSourceDisableFillRestoresLower(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	e.svc.SetRefill(func(channels []string) { t.Errorf("refill called for a fill source: %v", channels) })
+	ch := []tvChannel{{id: "1", names: []string{"本地台"}}}
+	e.files.set("/high.xml", buildXMLTV(ch, []tvProg{{"1", "H", e.h(8), e.h(10)}}))
+	e.files.set("/low.xml", buildXMLTV(ch, []tvProg{{"1", "L", e.h(8), e.h(10)}}))
+	high := e.addFill(t, "/high.xml", 1)
+	low := e.addFill(t, "/low.xml", 5)
+	e.svc.SyncAll(ctx)
+
+	high.Enabled = 0
+	if _, err := e.svc.Update(ctx, high); err != nil {
+		t.Fatal(err)
+	}
+	waitPrograms(t, e, "本地台", low.ProviderID()+":L")
+	waitStatus(t, e, low.ID, model.CustomSourceStatusSuccess)
+}
+
+// 切换模式：先清除按原模式写入的节目，再按新模式同步
+func TestCustomSourceModeSwitch(t *testing.T) {
+	e := newCustomEnv(t)
+	ctx := context.Background()
+	e.seedBuiltinDay(t, "CCTV1", 1, "t") // 内置只有明天
+	e.files.set("/a.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
+		[]tvProg{{"1", "today", e.h(8), e.h(9)}, {"1", "tomorrow", e.h(32), e.h(33)}}))
+	src := e.addSource(t, "/a.xml", 0, 1)
+	full := src.ProviderID()
+	e.svc.SyncAll(ctx)
+	assertPrograms(t, e.listed(t, "CCTV1"), full+":today", full+":tomorrow")
+
+	// 全量 -> 增量：明天内置有数据，不补（内置明天的数据已被全量源覆盖过，等补抓）；今天补上
+	src.Mode = model.CustomSourceModeFill
+	updated, err := e.svc.Update(ctx, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fill := updated.ProviderID()
+	if fill == full || !strings.HasPrefix(fill, model.CustomSourceFillProviderPrefix) {
+		t.Fatalf("provider id after switch = %q", fill)
+	}
+	waitPrograms(t, e, "CCTV1", fill+":today", fill+":tomorrow")
+
+	// 增量 -> 全量
+	updated.Mode = model.CustomSourceModeFull
+	if _, err := e.svc.Update(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	waitPrograms(t, e, "CCTV1", full+":today", full+":tomorrow")
+}
+
+func TestSourceOrder(t *testing.T) {
+	full := model.CustomSourceModeFull
+	fill := model.CustomSourceModeFill
+	sources := []*model.CustomSource{
+		{ID: 1, Mode: fill, Priority: 5},
+		{ID: 2, Mode: full, Priority: 1}, // 全量源的 priority 不起作用
+		{ID: 3, Mode: fill, Priority: 1},
+		{ID: 4, Mode: full, Priority: 0},
+		{ID: 5, Mode: fill, Priority: 1},
+	}
+	var got []int64
+	for _, s := range sourceOrder(sources) {
+		got = append(got, s.ID)
+	}
+	if want := []int64{2, 4, 3, 5, 1}; !slices.Equal(got, want) {
+		t.Errorf("order = %v, want %v", got, want)
 	}
 }

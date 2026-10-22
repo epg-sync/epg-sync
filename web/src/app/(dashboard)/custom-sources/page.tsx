@@ -22,17 +22,42 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { useToast } from "@/hooks/use-toast"
 import api from "@/lib/api"
 import type { CustomSource } from "@/types"
+
+type Mode = CustomSource["mode"]
 
 const DEFAULT_PRIORITY = 100
 
 const emptyForm = {
   name: "",
   url: "",
+  mode: "full" as Mode,
   enabled: 1,
   priority: String(DEFAULT_PRIORITY),
+}
+
+const modeInfo: Record<Mode, { label: string; badge: string; description: string }> = {
+  full: {
+    label: "全量覆盖",
+    badge: "bg-purple-100 text-purple-800",
+    description:
+      "文件里某个频道某天有节目，这一天就整天以文件为准，覆盖内置节目。多个全量源争同一天时，先添加的优先。",
+  },
+  fill: {
+    label: "增量补充",
+    badge: "bg-sky-100 text-sky-800",
+    description:
+      "只补内置数据源和全量源当天都没有节目的频道。多个增量源之间按优先级，数字越小越优先。",
+  },
 }
 
 const statusStyles: Record<string, { label: string; className: string }> = {
@@ -113,6 +138,7 @@ export default function CustomSourcesPage() {
     setFormData({
       name: source.name,
       url: source.url,
+      mode: source.mode,
       enabled: source.enabled,
       priority: String(source.priority),
     })
@@ -131,11 +157,15 @@ export default function CustomSourcesPage() {
       toast({ variant: "destructive", title: "地址必须以 http:// 或 https:// 开头" })
       return null
     }
+    if (formData.mode !== "fill") {
+      // 优先级只对增量源有意义，全量源不提交（后端保持原值）
+      return { name, url, mode: formData.mode, enabled: formData.enabled }
+    }
     if (!Number.isInteger(priority) || priority < 0 || priority > 100000) {
       toast({ variant: "destructive", title: "优先级必须是 0 到 100000 的整数" })
       return null
     }
-    return { name, url, enabled: formData.enabled, priority }
+    return { name, url, mode: formData.mode, enabled: formData.enabled, priority }
   }
 
   const handleCreate = async () => {
@@ -158,8 +188,10 @@ export default function CustomSourcesPage() {
     }
   }
 
-  const DISABLE_CONFIRM =
-    "停用后会清除这个数据源写入的全部节目，并重新同步其余数据源。\n被它覆盖掉的内置节目要等下一次全量同步才会补回来。确定停用吗?"
+  const PURGE_NOTE =
+    "它写入的节目会全部清除：全量源占用过的频道会在后台补抓内置节目，其余数据源会重新同步。\n注意：内置数据源只能补抓当天的节目，之后几天的要等到当天才会抓取。"
+  const DISABLE_CONFIRM = `确定停用吗?\n\n${PURGE_NOTE}`
+  const MODE_CHANGE_CONFIRM = `切换覆盖模式会先清除按原模式写入的节目，再按新模式重新同步。确定切换吗?\n\n${PURGE_NOTE}`
 
   const conflictText = (error: any, fallback: string) =>
     error.response?.status === 409 ? "有数据源正在同步，请稍后再试" : errorText(error, fallback)
@@ -168,7 +200,13 @@ export default function CustomSourcesPage() {
     if (!editingSource) return
     const payload = buildPayload()
     if (!payload) return
-    if (editingSource.enabled === 1 && payload.enabled !== 1 && !confirm(DISABLE_CONFIRM)) return
+    if (editingSource.enabled === 1) {
+      if (payload.enabled !== 1) {
+        if (!confirm(DISABLE_CONFIRM)) return
+      } else if (payload.mode !== editingSource.mode && !confirm(MODE_CHANGE_CONFIRM)) {
+        return
+      }
+    }
     try {
       await api.put(`/admin/custom-sources/${editingSource.id}`, payload)
       toast({ title: "更新成功", description: "数据源已更新" })
@@ -190,7 +228,6 @@ export default function CustomSourcesPage() {
         name: source.name,
         url: source.url,
         enabled: enabled ? 1 : 0,
-        priority: source.priority,
       })
       loadSources(true)
     } catch (error: any) {
@@ -205,7 +242,7 @@ export default function CustomSourcesPage() {
   const handleDelete = async (source: CustomSource) => {
     if (
       !confirm(
-        `确定要删除数据源「${source.name}」吗?\n\n它写入的节目会一并清除，其余数据源会重新同步；被它覆盖掉的内置节目要等下一次全量同步才会补回来。自动创建的频道会保留。`
+        `确定要删除数据源「${source.name}」吗?\n\n${PURGE_NOTE}\n自动创建的频道会保留。`
       )
     )
       return
@@ -228,7 +265,7 @@ export default function CustomSourcesPage() {
       await api.post(`/admin/custom-sources/${source.id}/sync`)
       toast({
         title: "已开始同步",
-        description: "正在后台按优先级同步所有已启用的数据源",
+        description: "正在后台同步所有已启用的数据源",
       })
       loadSources(true)
     } catch (error: any) {
@@ -249,8 +286,8 @@ export default function CustomSourcesPage() {
         <div>
           <h1 className="text-3xl font-bold">数据源</h1>
           <p className="text-gray-500 mt-1">
-            添加自己的 XMLTV 节目单文件（支持 .xml 和 .xml.gz），优先于内置数据源；
-            多个数据源重叠时优先级数字小的优先
+            添加自己的 XMLTV 节目单文件（支持 .xml 和 .xml.gz）。全量覆盖的数据源优先于内置数据源，
+            增量补充的数据源只补内置数据源没有的节目
           </p>
         </div>
         <Button onClick={() => setIsCreateOpen(true)}>
@@ -268,6 +305,7 @@ export default function CustomSourcesPage() {
               <TableRow>
                 <TableHead>名称</TableHead>
                 <TableHead>地址</TableHead>
+                <TableHead>覆盖模式</TableHead>
                 <TableHead>优先级</TableHead>
                 <TableHead>启用</TableHead>
                 <TableHead>同步状态</TableHead>
@@ -279,7 +317,7 @@ export default function CustomSourcesPage() {
             <TableBody>
               {sources.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={8} className="text-center text-gray-500 py-8">
+                  <TableCell colSpan={9} className="text-center text-gray-500 py-8">
                     还没有数据源，点击右上角「新建数据源」添加
                   </TableCell>
                 </TableRow>
@@ -295,7 +333,23 @@ export default function CustomSourcesPage() {
                     >
                       {source.url}
                     </TableCell>
-                    <TableCell>{source.priority}</TableCell>
+                    <TableCell>
+                      <span
+                        className={`px-2 py-1 rounded text-xs whitespace-nowrap ${modeInfo[source.mode].badge}`}
+                        title={modeInfo[source.mode].description}
+                      >
+                        {modeInfo[source.mode].label}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      {source.mode === "fill" ? (
+                        source.priority
+                      ) : (
+                        <span className="text-gray-400" title="全量覆盖按添加顺序，先添加的优先">
+                          -
+                        </span>
+                      )}
+                    </TableCell>
                     <TableCell>
                       <Switch
                         checked={source.enabled === 1}
@@ -318,6 +372,14 @@ export default function CustomSourcesPage() {
                           {source.last_error}
                         </div>
                       )}
+                      {source.last_status === "success" && source.last_message && (
+                        <div
+                          className="text-xs text-gray-500 mt-1 max-w-xs truncate"
+                          title={source.last_message}
+                        >
+                          {source.last_message}
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell className="text-sm">{formatTime(source.last_sync_at)}</TableCell>
                     <TableCell>{source.program_count}</TableCell>
@@ -327,7 +389,7 @@ export default function CustomSourcesPage() {
                         size="sm"
                         title={
                           source.enabled === 1
-                            ? "立即同步（按优先级同步所有已启用的数据源）"
+                            ? "立即同步（同步所有已启用的数据源）"
                             : "已停用，启用后才能同步"
                         }
                         disabled={source.enabled !== 1 || source.last_status === "running"}
@@ -374,8 +436,7 @@ export default function CustomSourcesPage() {
           <DialogHeader>
             <DialogTitle>{editingSource ? "编辑数据源" : "新建数据源"}</DialogTitle>
             <DialogDescription>
-              文件里的所有频道都会导入，认不出的频道会自动新建；
-              和内置数据源重叠的时段以这里的文件为准
+              文件里的所有频道都会导入，认不出的频道会自动新建
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
@@ -398,19 +459,37 @@ export default function CustomSourcesPage() {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="priority">优先级</Label>
-              <Input
-                id="priority"
-                type="number"
-                min={0}
-                max={100000}
-                value={formData.priority}
-                onChange={(e) => setFormData({ ...formData, priority: e.target.value })}
-              />
-              <p className="text-xs text-gray-500">
-                数字越小优先级越高；多个数据源覆盖同一频道的同一时段时，以优先级高的为准
-              </p>
+              <Label htmlFor="mode">覆盖模式</Label>
+              <Select
+                value={formData.mode}
+                onValueChange={(value) => setFormData({ ...formData, mode: value as Mode })}
+              >
+                <SelectTrigger id="mode" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="full">{modeInfo.full.label}</SelectItem>
+                  <SelectItem value="fill">{modeInfo.fill.label}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-gray-500">{modeInfo[formData.mode].description}</p>
             </div>
+            {formData.mode === "fill" && (
+              <div className="space-y-2">
+                <Label htmlFor="priority">优先级</Label>
+                <Input
+                  id="priority"
+                  type="number"
+                  min={0}
+                  max={100000}
+                  value={formData.priority}
+                  onChange={(e) => setFormData({ ...formData, priority: e.target.value })}
+                />
+                <p className="text-xs text-gray-500">
+                  数字越小优先级越高；多个增量源能补同一频道的同一天时，以优先级高的为准
+                </p>
+              </div>
+            )}
             <div className="flex items-center gap-3">
               <Label htmlFor="enabled">启用</Label>
               <Switch

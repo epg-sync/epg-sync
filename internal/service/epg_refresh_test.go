@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -232,7 +233,7 @@ func TestSyncSkipsExistingWithoutForce(t *testing.T) {
 	assertPrograms(t, env.today(t, "山东卫视"), "vl:vl-x")
 }
 
-// 自定义源在所有 provider 之后执行并覆盖重叠时段；它下载失败时频道回退到 provider 的数据
+// 全量自定义源在所有 provider 之后执行，当天整天以它为准；它下载失败时频道回退到 provider 的数据
 func TestSyncAllEPGAppliesCustomSourcesLast(t *testing.T) {
 	vl := newFakeProvider("vl", 1, map[string]fakeResult{"CCTV1": {titles: []string{"vl-a", "vl-b"}}})
 	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, vl)
@@ -246,15 +247,15 @@ func TestSyncAllEPGAppliesCustomSourcesLast(t *testing.T) {
 	files := newFileServer(t)
 	files.set("/epg.xml", buildXMLTV(
 		[]tvChannel{{id: "1", names: []string{"CCTV-1高清"}}},
-		[]tvProg{{"1", "cust", day, day.Add(time.Hour)}}, // 与 vl-a (00:00-01:00) 重叠
+		[]tvProg{{"1", "cust", day.Add(2 * time.Hour), day.Add(3 * time.Hour)}},
 	))
-	src := &model.CustomSource{Name: "电信", URL: files.URL + "/epg.xml", Enabled: 1, Priority: 10}
+	src := &model.CustomSource{Name: "电信", URL: files.URL + "/epg.xml", Mode: model.CustomSourceModeFull, Enabled: 1}
 	if err := customRepo.Create(context.Background(), src); err != nil {
 		t.Fatal(err)
 	}
 
 	env.scheduler.SyncAllEPG(true)
-	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":cust", "vl:vl-b")
+	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":cust")
 
 	// 自定义源下载失败：不动数据，下一轮强制刷新后频道回到 provider 的完整数据
 	files.remove("/epg.xml")
@@ -264,4 +265,243 @@ func TestSyncAllEPGAppliesCustomSourcesLast(t *testing.T) {
 	if got.LastStatus != model.CustomSourceStatusFailed {
 		t.Errorf("status = %q, want failed", got.LastStatus)
 	}
+}
+
+// 零点补抓（不强制）：当天只有增量源的节目时，内置源照常抓取并换掉它们；
+// 之后增量源再同步时也不会再补这一天
+func TestMidnightSyncReplacesFillPrograms(t *testing.T) {
+	vl := newFakeProvider("vl", 1, map[string]fakeResult{"CCTV1": {titles: []string{"vl-a", "vl-b"}}})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, vl)
+
+	customRepo := postgres.NewCustomSourceRepository(env.db)
+	custom := NewCustomSourceService(customRepo, postgres.NewChannelRepository(env.db), env.programs, cache.NewMemoryCache())
+	env.scheduler.SetCustomSources(custom)
+
+	now := time.Now()
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	files := newFileServer(t)
+	files.set("/fill.xml", buildXMLTV(
+		[]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
+		[]tvProg{{"1", "fill-a", day, day.Add(time.Hour)}, {"1", "fill-b", day.Add(time.Hour), day.Add(2 * time.Hour)}},
+	))
+	src := &model.CustomSource{Name: "补充", URL: files.URL + "/fill.xml", Mode: model.CustomSourceModeFill, Enabled: 1, Priority: 10}
+	if err := customRepo.Create(context.Background(), src); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟前一天提前补进来的数据：只有增量源
+	custom.SyncAll(context.Background())
+	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":fill-a", src.ProviderID()+":fill-b")
+
+	env.scheduler.SyncAllEPG(false)
+
+	if got := vl.requestedChannels(); len(got) != 1 || got[0] != "CCTV1" {
+		t.Errorf("vl requested %v, want CCTV1 (fill-only day must not count as existing)", got)
+	}
+	assertPrograms(t, env.today(t, "CCTV1"), "vl:vl-a", "vl:vl-b")
+}
+
+// 当天已有全量源或内置源的节目时，零点补抓照旧跳过
+func TestMidnightSyncSkipsDaysWithFullPrograms(t *testing.T) {
+	vl := newFakeProvider("vl", 1, map[string]fakeResult{"CCTV1": {titles: []string{"vl-a"}}})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, vl)
+	env.seed(t, "CCTV1", "custom:1", "full-a")
+
+	env.scheduler.SyncAllEPG(false)
+
+	if got := vl.requestedChannels(); len(got) != 0 {
+		t.Errorf("vl requested %v for a day that already has full custom programs", got)
+	}
+	assertPrograms(t, env.today(t, "CCTV1"), "custom:1:full-a")
+}
+
+// gatedProvider 在 gate 关闭前阻塞每次抓取，用来制造「同步进行中」的状态；
+// 每次开始抓取时向 entered 发送频道名，并记录同时在抓的最大数量
+type gatedProvider struct {
+	*fakeProvider
+	gate    chan struct{}
+	entered chan string
+
+	mu       sync.Mutex
+	inflight int
+	maxIn    int
+}
+
+func newGatedProvider(id string, results map[string]fakeResult) *gatedProvider {
+	return &gatedProvider{
+		fakeProvider: newFakeProvider(id, 1, results),
+		gate:         make(chan struct{}),
+		entered:      make(chan string, 64),
+	}
+}
+
+func (g *gatedProvider) FetchEPG(ctx context.Context, providerChannelID, channelID string, date time.Time) ([]*model.Program, error) {
+	g.mu.Lock()
+	g.inflight++
+	g.maxIn = max(g.maxIn, g.inflight)
+	g.mu.Unlock()
+	g.entered <- channelID
+	<-g.gate
+	defer func() {
+		g.mu.Lock()
+		g.inflight--
+		g.mu.Unlock()
+	}()
+	return g.fakeProvider.FetchEPG(ctx, providerChannelID, channelID, date)
+}
+
+func (g *gatedProvider) FetchEPGBatch(ctx context.Context, infos []*model.ChannelMappingInfo, date time.Time) ([]*model.Program, error) {
+	return g.BaseProvider.FetchEPGBatch(ctx, g, infos, date)
+}
+
+func waitEntered(t *testing.T, g *gatedProvider) string {
+	t.Helper()
+	select {
+	case ch := <-g.entered:
+		return ch
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider was not asked to fetch")
+		return ""
+	}
+}
+
+func waitRefillIdle(t *testing.T, s *SchedulerService) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.refillMu.Lock()
+		idle := !s.refillRunning
+		s.refillMu.Unlock()
+		if idle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("refill did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// 两个全量同步同时触发：第二个等第一个结束再开始，不会并行抓取，也不会把同一批节目写两遍
+func TestSyncAllEPGRunsOneAtATime(t *testing.T) {
+	g := newGatedProvider("vl", map[string]fakeResult{"CCTV1": {titles: []string{"a", "b"}}})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1"}}, g)
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			env.scheduler.SyncAllEPG(false)
+		}()
+	}
+	waitEntered(t, g)
+	// 给第二个同步足够的时间：没有互斥的话，它会在这期间也开始抓取
+	time.Sleep(200 * time.Millisecond)
+	close(g.gate)
+	wg.Wait()
+
+	if g.maxIn != 1 {
+		t.Errorf("max concurrent fetches = %d, want 1", g.maxIn)
+	}
+	assertPrograms(t, env.today(t, "CCTV1"), "vl:a", "vl:b")
+}
+
+// 补抓只处理传入的频道，其它当天同样缺数据的频道不会被顺带抓取
+func TestRefillChannelsOnlyFetchesGivenChannels(t *testing.T) {
+	vl := newFakeProvider("vl", 1, map[string]fakeResult{
+		"CCTV1": {titles: []string{"a"}},
+		"CCTV2": {titles: []string{"x"}},
+	})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1", "CCTV2"}}, vl)
+
+	env.scheduler.RefillChannels([]string{"CCTV1"})
+	waitRefillIdle(t, env.scheduler)
+
+	if got := vl.requestedChannels(); len(got) != 1 || got[0] != "CCTV1" {
+		t.Errorf("requested %v, want only CCTV1", got)
+	}
+	assertPrograms(t, env.today(t, "CCTV1"), "vl:a")
+	assertPrograms(t, env.today(t, "CCTV2"))
+}
+
+// 补抓进行中又来了两次请求：它们合并成一轮，而不是各跑一轮。
+// 每轮结束都会同步一次自定义源，用自定义源文件被下载的次数数出轮数
+func TestRefillChannelsCoalesces(t *testing.T) {
+	g := newGatedProvider("vl", map[string]fakeResult{
+		"CCTV1": {titles: []string{"a"}},
+		"CCTV2": {titles: []string{"x"}},
+		"CCTV3": {titles: []string{"y"}},
+	})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1", "CCTV2", "CCTV3"}}, g)
+
+	files := newFileServer(t)
+	files.set("/fill.xml", buildXMLTV([]tvChannel{{id: "1", names: []string{"本地台"}}}, nil))
+	customRepo := postgres.NewCustomSourceRepository(env.db)
+	custom := NewCustomSourceService(customRepo, postgres.NewChannelRepository(env.db), env.programs, cache.NewMemoryCache())
+	env.scheduler.SetCustomSources(custom)
+	if err := customRepo.Create(context.Background(), &model.CustomSource{
+		Name: "补充", URL: files.URL + "/fill.xml", Mode: model.CustomSourceModeFill, Enabled: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	env.scheduler.RefillChannels([]string{"CCTV1"})
+	if ch := waitEntered(t, g); ch != "CCTV1" {
+		t.Fatalf("first round fetched %s", ch)
+	}
+	// 第一轮还卡在抓取中
+	env.scheduler.RefillChannels([]string{"CCTV2"})
+	env.scheduler.RefillChannels([]string{"CCTV3", "CCTV2"})
+	close(g.gate)
+	waitRefillIdle(t, env.scheduler)
+
+	if got := g.requestedChannels(); strings.Join(got, ",") != "CCTV1,CCTV2,CCTV3" {
+		t.Errorf("requested %v, want each of CCTV1..3 once", got)
+	}
+	if n := files.hitCount("/fill.xml"); n != 2 {
+		t.Errorf("refill rounds = %d, want 2 (the two later calls merged into one round)", n)
+	}
+	if g.maxIn > 2 {
+		t.Errorf("max concurrent fetches = %d, rounds overlapped", g.maxIn)
+	}
+}
+
+// 删除全量源后，只补抓它占用过的频道，其它当天同样缺数据的频道不受影响
+func TestDeleteFullSourceRefillsOnlyItsChannels(t *testing.T) {
+	vl := newFakeProvider("vl", 1, map[string]fakeResult{
+		"CCTV1": {titles: []string{"vl-a"}},
+		"CCTV2": {titles: []string{"vl-x"}},
+	})
+	env := newRefreshEnv(t, map[string][]string{"vl": {"CCTV1", "CCTV2"}}, vl)
+
+	customRepo := postgres.NewCustomSourceRepository(env.db)
+	custom := NewCustomSourceService(customRepo, postgres.NewChannelRepository(env.db), env.programs, cache.NewMemoryCache())
+	env.scheduler.SetCustomSources(custom)
+	custom.SetRefill(env.scheduler.RefillChannels)
+
+	now := time.Now()
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	files := newFileServer(t)
+	files.set("/full.xml", buildXMLTV(
+		[]tvChannel{{id: "1", names: []string{"CCTV-1"}}},
+		[]tvProg{{"1", "cust", day.Add(2 * time.Hour), day.Add(3 * time.Hour)}},
+	))
+	src := &model.CustomSource{Name: "电信", URL: files.URL + "/full.xml", Mode: model.CustomSourceModeFull, Enabled: 1}
+	if err := customRepo.Create(context.Background(), src); err != nil {
+		t.Fatal(err)
+	}
+	custom.SyncAll(context.Background())
+	assertPrograms(t, env.today(t, "CCTV1"), src.ProviderID()+":cust")
+
+	if err := custom.Delete(context.Background(), src.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitRefillIdle(t, env.scheduler)
+
+	if got := vl.requestedChannels(); len(got) != 1 || got[0] != "CCTV1" {
+		t.Errorf("requested %v, want only CCTV1", got)
+	}
+	assertPrograms(t, env.today(t, "CCTV1"), "vl:vl-a")
+	assertPrograms(t, env.today(t, "CCTV2"))
 }

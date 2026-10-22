@@ -223,10 +223,10 @@ func (r *programRepo) ReplaceChannelDay(ctx context.Context, channelID string, d
 	return nil
 }
 
-// 每条 DELETE 最多带的时间段数，避免超过 Postgres 单条语句 65535 个参数的上限
-const replaceRangesPerStatement = 1000
+// fillProviderPattern 匹配增量源写入的节目
+var fillProviderPattern = model.CustomSourceFillProviderPrefix + "%"
 
-func (r *programRepo) ReplaceChannelRanges(ctx context.Context, channelID string, ranges []model.TimeRange, providerID string, ownFrom time.Time, programs []*model.Program) error {
+func (r *programRepo) ReplaceChannelDays(ctx context.Context, channelID string, days []model.TimeRange, providerID string, ownFrom time.Time, programs []*model.Program) error {
 	var deleted int64
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Where("channel_id = ? AND provider_id = ? AND end_time > ?", channelID, providerID, ownFrom).
@@ -236,16 +236,15 @@ func (r *programRepo) ReplaceChannelRanges(ctx context.Context, channelID string
 		}
 		deleted = result.RowsAffected
 
-		for start := 0; start < len(ranges); start += replaceRangesPerStatement {
-			chunk := ranges[start:min(start+replaceRangesPerStatement, len(ranges))]
-			overlaps := make([]string, len(chunk))
-			args := make([]any, 0, 1+2*len(chunk))
+		if len(days) > 0 {
+			conds := make([]string, len(days))
+			args := make([]any, 0, 1+2*len(days))
 			args = append(args, channelID)
-			for i, rg := range chunk {
-				overlaps[i] = "(start_time < ? AND end_time > ?)"
-				args = append(args, rg.To, rg.From)
+			for i, d := range days {
+				conds[i] = "(start_time >= ? AND start_time < ?)"
+				args = append(args, d.From, d.To)
 			}
-			result := tx.Where("channel_id = ? AND ("+strings.Join(overlaps, " OR ")+")", args...).
+			result := tx.Where("channel_id = ? AND ("+strings.Join(conds, " OR ")+")", args...).
 				Delete(&model.Program{})
 			if result.Error != nil {
 				return result.Error
@@ -259,16 +258,68 @@ func (r *programRepo) ReplaceChannelRanges(ctx context.Context, channelID string
 		return tx.CreateInBatches(programs, 1000).Error
 	})
 	if err != nil {
-		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to replace programs in ranges")
+		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to replace programs by day")
 	}
 
-	logger.Debug("Replaced programs in ranges",
+	logger.Debug("Replaced programs by day",
 		logger.String("channel_id", channelID),
 		logger.String("provider_id", providerID),
-		logger.Int("ranges", len(ranges)),
+		logger.Int("days", len(days)),
 		logger.Int64("deleted", deleted),
 		logger.Int("inserted", len(programs)),
 	)
+	return nil
+}
+
+func (r *programRepo) ListProviderDays(ctx context.Context, channelID, timezone string, from, to time.Time) ([]*model.ProviderDay, error) {
+	var days []*model.ProviderDay
+	err := r.db.WithContext(ctx).
+		Model(&model.Program{}).
+		Select("DISTINCT COALESCE(provider_id, '') AS provider_id, to_char(start_time AT TIME ZONE ?, 'YYYY-MM-DD') AS day", timezone).
+		Where("channel_id = ? AND start_time >= ? AND start_time < ?", channelID, from, to).
+		Scan(&days).Error
+	if err != nil {
+		return nil, errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to list provider days")
+	}
+	return days, nil
+}
+
+func (r *programRepo) CreateBatchReplacingFill(ctx context.Context, programs []*model.Program) error {
+	if len(programs) == 0 {
+		return nil
+	}
+
+	// 各频道新节目覆盖的时间范围。按实际时间删除而不是按「天」，不受服务器时区影响；
+	// 同一天里范围之外剩下的增量节目，由自定义源下一次同步时清理
+	ranges := make(map[string]*model.TimeRange)
+	for _, p := range programs {
+		rg, ok := ranges[p.ChannelID]
+		if !ok {
+			ranges[p.ChannelID] = &model.TimeRange{From: p.StartTime, To: p.EndTime}
+			continue
+		}
+		if p.StartTime.Before(rg.From) {
+			rg.From = p.StartTime
+		}
+		if p.EndTime.After(rg.To) {
+			rg.To = p.EndTime
+		}
+	}
+
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for channelID, rg := range ranges {
+			err := tx.Where("channel_id = ? AND provider_id LIKE ? AND start_time < ? AND end_time > ?",
+				channelID, fillProviderPattern, rg.To, rg.From).
+				Delete(&model.Program{}).Error
+			if err != nil {
+				return err
+			}
+		}
+		return tx.CreateInBatches(programs, 1000).Error
+	})
+	if err != nil {
+		return errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to create programs in batch")
+	}
 	return nil
 }
 
@@ -286,6 +337,20 @@ func (r *programRepo) DeleteByProviderOutsideChannels(ctx context.Context, provi
 		return 0, errors.Wrap(result.Error, errors.ErrCodeDatabaseQuery, "failed to delete stale programs by provider")
 	}
 	return result.RowsAffected, nil
+}
+
+func (r *programRepo) ListChannelIDsByProvider(ctx context.Context, providerID string) ([]string, error) {
+	var ids []string
+	err := r.db.WithContext(ctx).
+		Model(&model.Program{}).
+		Distinct("channel_id").
+		Where("provider_id = ?", providerID).
+		Order("channel_id").
+		Pluck("channel_id", &ids).Error
+	if err != nil {
+		return nil, errors.Wrap(err, errors.ErrCodeDatabaseQuery, "failed to list channels by provider")
+	}
+	return ids, nil
 }
 
 func (r *programRepo) DeleteByProviderID(ctx context.Context, providerID string) (int64, error) {
@@ -315,6 +380,7 @@ func (r *programRepo) Exists(ctx context.Context, channelID string, date time.Ti
 	err := r.db.WithContext(ctx).
 		Model(&model.Program{}).
 		Where("channel_id = ? AND start_time >= ? AND start_time < ?", channelID, startOfDay, endOfDay).
+		Where("COALESCE(provider_id, '') NOT LIKE ?", fillProviderPattern).
 		Count(&count).Error
 	if err != nil {
 		logger.Error("Failed to check program existence",

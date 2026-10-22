@@ -154,7 +154,8 @@ func (s *EPGService) SyncEPG(ctx context.Context, channelID string, startDate, e
 			continue
 		}
 
-		if err := s.programRepo.CreateBatch(ctx, programs); err != nil {
+		// 当天只有增量源的节目时也会走到这里，写入的同时换掉它们
+		if err := s.programRepo.CreateBatchReplacingFill(ctx, programs); err != nil {
 			logger.Warn("Failed to save EPG",
 				logger.Err(err),
 				logger.String("channel_id", channelID),
@@ -176,7 +177,8 @@ func (s *EPGService) SyncEPG(ctx context.Context, channelID string, startDate, e
 	return nil
 }
 
-// SyncEPGBatch 为还没有节目的频道抓取并保存节目单，已有节目（不论来自哪个 provider）的频道跳过。
+// SyncEPGBatch 为还没有节目的频道抓取并保存节目单，已有节目（不论来自哪个 provider）的频道跳过；
+// 只有增量自定义源节目的频道不算已有，抓到后换掉它们。
 // 按优先级依次对各 provider 调用，就实现了「优先级高的先填」；强制刷新见 RefreshEPGBatch
 func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*model.ChannelMappingInfo, startDate, endDate time.Time) error {
 	if len(channelMappingInfos) == 0 {
@@ -246,7 +248,8 @@ func (s *EPGService) SyncEPGBatch(ctx context.Context, channelMappingInfos []*mo
 
 		programsToSave = append(programsToSave, programs...)
 
-		if err := s.programRepo.CreateBatch(ctx, programsToSave); err != nil {
+		// 当天只有增量源节目的频道也会被抓取，写入的同时换掉它们
+		if err := s.programRepo.CreateBatchReplacingFill(ctx, programsToSave); err != nil {
 			logger.Warn("Failed to save EPG batch",
 				logger.Err(err),
 				logger.Time("date", date),
